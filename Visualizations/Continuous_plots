@@ -1,0 +1,66 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import os
+
+# Output directory
+out_dir = "out_directory"
+os.makedirs(out_dir, exist_ok=True)
+
+for col in numeric_vars:
+    plt_vals = []
+
+    if col in madrc.columns:
+        madrc_vals = pd.to_numeric(madrc[col], errors="coerce").dropna()
+        if len(bal_vals) >= 5:
+            plt_vals.append(("MADRC", madrc_vals))
+
+    if col in nacc.columns:
+        nacc_vals = pd.to_numeric(nacc[col], errors="coerce").dropna()
+        if len(nacc_vals) >= 5:
+            plt_vals.append(("NACC", nacc_vals))
+
+    if len(plt_vals) == 0:
+        print(f"Skipping {col}: no numeric data available.")
+        continue
+
+    # Create figure/axes explicitly
+    fig, ax = plt.subplots(figsize=(4, 4))
+
+    for label, vals in plt_vals:
+        sns.kdeplot(
+            x=vals,
+            fill=True,
+            label=label,
+            alpha=0.5,
+            ax=ax
+        )
+
+    ax.set_title(f"Distribution Comparison: {col}")
+    ax.set_xlabel(col)
+    ax.legend()
+    fig.tight_layout()
+
+    base_filename = f"{col}_distribution"
+
+    tif_path = os.path.join(out_dir, f"{base_filename}.tif")
+    jpg_path = os.path.join(out_dir, f"{base_filename}.jpg")
+
+    fig.savefig(
+        tif_path,
+        dpi=300,
+        format="tiff",
+        bbox_inches="tight"
+    )
+    fig.savefig(
+        jpg_path,
+        dpi=300,
+        format="jpg",
+        bbox_inches="tight"
+    )
+
+    print(f"Saved {tif_path} and {jpg_path}")
+
+    plt.show()
+    plt.close(fig)
