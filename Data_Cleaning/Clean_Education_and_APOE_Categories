@@ -1,0 +1,26 @@
+analysis_df['educ'] = pd.to_numeric(analysis_df['educ'], errors='coerce')
+
+analysis_df['educ_group'] = pd.cut(
+    analysis_df['educ'],
+    bins=[-np.inf, 12, 16, np.inf],
+    labels=['≤12', '13–16', '>16']
+)
+
+analysis_df['educ_group'] = analysis_df['educ_group'].astype(
+    pd.CategoricalDtype(
+        categories=['≤12', '13–16', '>16'],
+        ordered=True
+    )
+)
+
+def classify_apoe(x):
+    if pd.isna(x):
+        return np.nan
+    x = str(x)
+    return 'positive' if any(a in x for a in ['2', '4']) else 'negative'
+
+analysis_df['apoe_pos'] = analysis_df['apoe'].apply(classify_apoe)
+
+analysis_df['apoe_pos'] = analysis_df['apoe_pos'].astype(
+    pd.CategoricalDtype(categories=['negative', 'positive'], ordered=True)
+)
