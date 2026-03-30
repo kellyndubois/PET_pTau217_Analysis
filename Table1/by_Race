@@ -1,0 +1,41 @@
+import numpy as np
+import pandas as pd
+
+df = analysis_df.copy()
+
+# Define race groups from race_black (1 = B/AA, 0 = NHW)
+df["race_group"] = np.where(df["race_black"] == 1, "B/AA", "NHW")
+df["race_group"] = df["race_group"].astype("category")
+
+# Variables to summarize
+vars_cont = ["age", "ptau217", "centiloids", "cdrsum", "mocatots"]  
+vars_cat  = ["sex", "apoe_pos", "educ_group", "dataset", "madc_dx", "amyloid_status_num"]
+
+# Subset by dataset
+df_madrc      = df[df["dataset"] == "MADRC"].copy()
+df_nacc     = df[df["dataset"] == "NACC"].copy()
+df_combined = df.copy()
+
+# --- Supplemental tables stratified by race (using table1 with p-values) ---
+
+supp_madrc_race = table1(
+    df_madrc,
+    group_col="race_group",          # "B/AA" vs "NHW"
+    vars_continuous=vars_cont,
+    vars_categorical=vars_cat
+)
+
+supp_nacc_race = table1(
+    df_nacc,
+    group_col="race_group",
+    vars_continuous=vars_cont,
+    vars_categorical=vars_cat
+)
+
+supp_combined_race = table1(
+    df_combined,
+    group_col="race_group",
+    vars_continuous=vars_cont,
+    vars_categorical=vars_cat
+)
+
