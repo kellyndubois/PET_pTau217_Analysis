@@ -1,0 +1,197 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import kruskal, chi2_contingency
+
+def table1(df, group_col, vars_continuous=None, vars_categorical=None):
+    """
+    Produce Table 1 summary stratified by Dx group, using:
+      - median [IQR] for continuous variables
+      - n (%) for categorical variables
+      - n (%) missing counts for both
+      - p-values:
+          * continuous: Kruskal–Wallis across groups
+          * categorical: chi-square test across groups
+      - Bonferroni-adjusted p-values across all variables
+      - 'Overall' column summarizing entire df (not used in p-values)
+    """
+
+    if vars_continuous is None: vars_continuous = []
+    if vars_categorical is None: vars_categorical = []
+
+    groups = sorted(df[group_col].dropna().unique())
+    out = []
+
+    # store raw p-values per variable (by base name, e.g. "age", "sex")
+    raw_p = {}
+
+    # ---------- continuous variables ----------
+    for var in vars_continuous:
+        summary_row = {"Variable": var}
+        missing_row = {"Variable": f"{var} (missing)"}
+
+        # p-value: Kruskal–Wallis across groups (non-parametric)
+        data_per_group = [
+            df.loc[df[group_col] == g, var].dropna()
+            for g in groups
+        ]
+        nonempty_groups = [s for s in data_per_group if len(s) > 0]
+        if len(nonempty_groups) > 1:
+            stat, p_val = kruskal(*nonempty_groups)
+        else:
+            p_val = np.nan
+        raw_p[var] = p_val
+
+        # per-group summaries
+        for g, sub in zip(groups, data_per_group):
+            n_total = df[df[group_col] == g].shape[0]
+            n_nonmissing = sub.shape[0]
+            n_missing = n_total - n_nonmissing
+
+            if n_nonmissing > 0:
+                med = sub.median()
+                q1 = sub.quantile(0.25)
+                q3 = sub.quantile(0.75)
+                summary_row[g] = f"{med:.2f} [{q1:.2f}–{q3:.2f}] (n={n_nonmissing})"
+            else:
+                summary_row[g] = "NA"
+
+            pct_missing = 100 * n_missing / n_total if n_total > 0 else 0
+            missing_row[g] = f"{n_missing} ({pct_missing:.2f}%)"
+
+        # overall summary (not part of p-value computation)
+        overall = df[var].dropna()
+        n_total_all = df.shape[0]
+        n_nonmissing_all = overall.shape[0]
+        n_missing_all = n_total_all - n_nonmissing_all
+
+        if n_nonmissing_all > 0:
+            med_all = overall.median()
+            q1_all = overall.quantile(0.25)
+            q3_all = overall.quantile(0.75)
+            summary_row["Overall"] = f"{med_all:.2f} [{q1_all:.2f}–{q3_all:.2f}] (n={n_nonmissing_all})"
+        else:
+            summary_row["Overall"] = "NA"
+
+        pct_missing_all = 100 * n_missing_all / n_total_all if n_total_all > 0 else 0
+        missing_row["Overall"] = f"{n_missing_all} ({pct_missing_all:.2f}%)"
+
+        out.append(summary_row)
+        out.append(missing_row)
+
+    # ---------- categorical variables ----------
+    for var in vars_categorical:
+        # Build contingency table for chi-square
+        ctab = pd.crosstab(df[group_col], df[var])
+        if ctab.shape[0] > 1 and ctab.shape[1] > 1:
+            chi2, p_val_cat, dof, exp = chi2_contingency(ctab)
+        else:
+            p_val_cat = np.nan
+        raw_p[var] = p_val_cat
+
+        cats = df[var].dropna().unique()
+        cats = sorted(cats)  # stable order
+
+        for cat in cats:
+            row = {"Variable": f"{var}={cat}"}
+            for g in groups:
+                sub = df[df[group_col] == g]
+                n_total = sub.shape[0]
+                n_cat = sub[sub[var] == cat].shape[0]
+                pct = 100 * n_cat / n_total if n_total > 0 else 0
+                row[g] = f"{n_cat} ({pct:.2f}%)"
+
+            # overall count for this category
+            n_total_all = df.shape[0]
+            n_cat_all = df[df[var] == cat].shape[0]
+            pct_all = 100 * n_cat_all / n_total_all if n_total_all > 0 else 0
+            row["Overall"] = f"{n_cat_all} ({pct_all:.2f}%)"
+
+            out.append(row)
+
+        # Missing row for the categorical variable
+        missing_row = {"Variable": f"{var} (missing)"}
+        for g in groups:
+            sub = df[df[group_col] == g][var]
+            n_total = sub.shape[0]
+            n_missing = sub.isna().sum()
+            pct_missing = 100 * n_missing / n_total if n_total > 0 else 0
+            missing_row[g] = f"{n_missing} ({pct_missing:.2f}%)"
+
+        # overall missing for this var
+        n_total_all = df.shape[0]
+        n_missing_all = df[var].isna().sum()
+        pct_missing_all = 100 * n_missing_all / n_total_all if n_total_all > 0 else 0
+        missing_row["Overall"] = f"{n_missing_all} ({pct_missing_all:.2f}%)"
+
+        out.append(missing_row)
+
+    # ---------- Convert to DataFrame and add p-values ----------
+    df_out = pd.DataFrame(out)
+
+    # make sure all expected columns exist
+    if "Overall" not in df_out.columns:
+        df_out["Overall"] = ""
+
+    df_out["p_value"] = ""
+    df_out["p_value_bonf"] = ""
+
+    # Bonferroni across all variables where a test was actually computed
+    valid_ps = [p for p in raw_p.values() if (p is not None and not np.isnan(p))]
+    m = len(valid_ps)  # number of tests
+    adj_p = {}
+    for var, p in raw_p.items():
+        if p is None or np.isnan(p) or m == 0:
+            adj_p[var] = np.nan
+        else:
+            adj_p[var] = min(p * m, 1.0)
+
+    # assign raw and adjusted p-values to the appropriate rows
+    for var, p in raw_p.items():
+        # Continuous variables: p-value on the main summary row (Variable == var)
+        if var in vars_continuous:
+            mask = df_out["Variable"] == var
+            idxs = df_out.index[mask].tolist()
+            if idxs:
+                idx = idxs[0]
+                if p is not None and not np.isnan(p):
+                    df_out.at[idx, "p_value"] = f"{p:.3g}"
+                    padj = adj_p[var]
+                    df_out.at[idx, "p_value_bonf"] = f"{padj:.3g}" if not np.isnan(padj) else ""
+            continue
+
+        # Categorical variables: p-value on the first category row (e.g., "sex=Female")
+        if var in vars_categorical:
+            mask = df_out["Variable"].str.startswith(f"{var}=")
+            idxs = df_out.index[mask].tolist()
+            if idxs:
+                idx = idxs[0]  # first category row
+                if p is not None and not np.isnan(p):
+                    df_out.at[idx, "p_value"] = f"{p:.3g}"
+                    padj = adj_p[var]
+                    df_out.at[idx, "p_value_bonf"] = f"{padj:.3g}" if not np.isnan(padj) else ""
+
+    # order columns
+    col_order = ["Variable", "Overall"] + list(groups) + ["p_value", "p_value_bonf"]
+    # make sure all exist (in case of weird edge cases)
+    col_order = [c for c in col_order if c in df_out.columns]
+    df_out = df_out[col_order]
+
+    return df_out
+
+# ---------- Your original calls ----------
+
+vars_cont = ["age", "ptau217", "centiloids", "cdrsum", "mocatots"]  
+vars_cat = ["sex", "apoe_pos", "educ_group", "race_black", "amyloid_status_num"]
+
+df_madrc = analysis_df[analysis_df["dataset"] == "MADRC"].copy()
+df_nacc = analysis_df[analysis_df["dataset"] == "NACC"].copy()
+df_combined = analysis_df.copy()
+
+tbl_madrc = table1(df_madrc, group_col="madc_dx",
+                 vars_continuous=vars_cont, vars_categorical=vars_cat)
+
+tbl_nacc = table1(df_nacc, group_col="madc_dx",
+                  vars_continuous=vars_cont, vars_categorical=vars_cat)
+
+tbl_combined = table1(df_combined, group_col="madc_dx",
+                      vars_continuous=vars_cont, vars_categorical=vars_cat)
