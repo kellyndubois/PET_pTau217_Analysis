@@ -1,0 +1,84 @@
+def mediation_continuous(df, exposure, mediator, outcome, covariates=None, n_boot=1000, random_state=42):
+    import statsmodels.formula.api as smf
+    from sklearn.utils import resample
+    import numpy as np
+
+    if covariates is None:
+        covariates = []
+
+    rng = np.random.default_rng(random_state)
+
+    def _estimate(df):
+        # mediator model: linear
+        med_formula = f"{mediator} ~ {exposure}"
+        if covariates:
+            med_formula += " + " + " + ".join(covariates)
+
+        med_fit = smf.ols(med_formula, data=df).fit()
+
+        # outcome model: linear
+        out_formula = f"{outcome} ~ {exposure} + {mediator}"
+        if covariates:
+            out_formula += " + " + " + ".join(covariates)
+
+        out_fit = smf.ols(out_formula, data=df).fit()
+
+        # coefficients needed
+        a = med_fit.params[exposure]
+        b = out_fit.params[mediator]
+        c_prime = out_fit.params[exposure]
+        # total effect (from model without mediator)
+        tot = a * b + c_prime
+
+        return {
+            "ACME": a * b,
+            "ADE": c_prime,
+            "Total": tot
+        }
+
+    point = _estimate(df)
+
+    boots = {"ACME": [], "ADE": [], "Total": []}
+    for _ in range(n_boot):
+        bs = resample(df, replace=True, random_state=rng.integers(1e9))
+        est = _estimate(bs)
+        for k in boots:
+            boots[k].append(est[k])
+
+    def ci(x):
+        return (np.percentile(x, 2.5), np.percentile(x, 97.5))
+
+    return {
+        "ACME": {"estimate": point["ACME"], "CI": ci(boots["ACME"])},
+        "ADE": {"estimate": point["ADE"], "CI": ci(boots["ADE"])},
+        "Total": {"estimate": point["Total"], "CI": ci(boots["Total"])},
+        "Prop_mediated": {"estimate": point["ACME"]/point["Total"], 
+                          "CI": ci([a/t if t!=0 else np.nan for a,t in zip(boots["ACME"],boots["Total"])])}
+    }
+
+df_med = df_med.copy()
+
+# 1) Numerics as numeric
+for col in ["race_black", "centiloids", "log_ptau217", "age"]:
+    if col in df_med.columns:
+        df_med[col] = pd.to_numeric(df_med[col], errors="coerce")
+
+# 2) Categoricals as categorical
+cat_covs = ["sex", "apoe", "educ_group", "dataset", "madc_dx"]
+for col in cat_covs:
+    if col in df_med.columns:
+        df_med[col] = df_med[col].astype("category")
+
+# 3) Drop rows with missing in anything needed for mediation
+covs = ["age", "sex", "apoe", "educ_group", "dataset", "madc_dx"]
+needed = ["log_ptau217", "race_black", "centiloids"] + covs
+df_med = df_med.dropna(subset=needed).copy()
+
+res = mediation_continuous(
+    df_med,
+    exposure="race_black",
+    mediator="centiloids",
+    outcome="log_ptau217",
+    covariates=covs
+)
+print(res)
