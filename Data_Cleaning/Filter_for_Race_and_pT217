@@ -1,0 +1,58 @@
+import pandas as pd
+
+# Load dataset with race and pT217
+df = pd.read_csv(
+    "combined_dataset.csv",
+    dtype={"NACCID": "string"}
+)
+
+# Ensure numeric where needed
+df["RACE"] = pd.to_numeric(df["RACE"], errors="coerce")
+df["Ptau_217"] = pd.to_numeric(df["Ptau_217"], errors="coerce")
+
+# -----
+# 1) NACCIDs with RACE == 1 or 2 in ANY row
+# -----
+race_ok_ids = (
+    df.loc[df["RACE"].isin([1, 2]), "NACCID"]
+    .dropna()
+    .unique()
+)
+
+# -----
+# 2) NACCIDs with at least one non-NA Ptau_217
+# -----
+ptau_ok_ids = (
+    df.loc[df["Ptau_217"].notna(), "NACCID"]
+    .dropna()
+    .unique()
+)
+
+# -----
+# 3) Intersection of both conditions
+# -----
+keep_ids = set(race_ok_ids).intersection(ptau_ok_ids)
+
+# -----
+# 4) Filter dataframe (KEEP ALL ROWS for those NACCIDs)
+# -----
+df_filtered = df[df["NACCID"].isin(keep_ids)].copy()
+
+# Optional: sort nicely
+df_filtered = df_filtered.sort_values(["NACCID", "Date", "row_source"])
+
+# Save
+df_filtered.to_csv(
+    "nacc_dataset_filtered.csv",
+    index=False,
+    na_rep="NA"
+)
+
+# retained subjects
+df_filtered["NACCID"].nunique()
+
+# Confirm race condition holds
+df_filtered.groupby("NACCID")["RACE"].apply(lambda x: x.isin([1, 2]).any()).value_counts()
+
+# Confirm pTau condition holds
+df_filtered.groupby("NACCID")["Ptau_217"].apply(lambda x: x.notna().any()).value_counts()
