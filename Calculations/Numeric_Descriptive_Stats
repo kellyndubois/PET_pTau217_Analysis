@@ -1,0 +1,34 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import mannwhitneyu, chi2_contingency, fisher_exact
+
+def numeric_test(madrc, nacc, numeric_vars):
+    rows = []
+    for col in numeric_vars:
+        if col not in madrc.columns or col not in nacc.columns:
+            continue
+
+        x = pd.to_numeric(madrc[col], errors='coerce').dropna()
+        y = pd.to_numeric(nacc[col], errors='coerce').dropna()
+
+        if len(x) == 0 or len(y) == 0:
+            p = np.nan
+        else:
+            stat, p = mannwhitneyu(x, y, alternative='two-sided')
+
+        rows.append({
+            'variable': col,
+            'madrc_n': len(x),
+            'madrc_median': np.median(x) if len(x) > 0 else np.nan,
+            'madrc_IQR': (np.percentile(x,75) - np.percentile(x,25)) if len(x) > 0 else np.nan,
+            'nacc_n': len(y),
+            'nacc_median': np.median(y) if len(y) > 0 else np.nan,
+            'nacc_IQR': (np.percentile(y,75) - np.percentile(y,25)) if len(y) > 0 else np.nan,
+            'p_value': p
+        })
+
+    return pd.DataFrame(rows)
+
+num_results = numeric_test(madrc, nacc, numeric_vars)
+print("\n=== NUMERIC COMPARISON WITH P-VALUES ===")
+print(num_results)
