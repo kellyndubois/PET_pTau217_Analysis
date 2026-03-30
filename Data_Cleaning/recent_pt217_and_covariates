@@ -1,0 +1,225 @@
+#Get to one row per NACCID with the most recent pT217 date and all other non-NA covariates closest to that date (except for PET)
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv(
+    "nacc_dataset_filtered.csv",
+    dtype={"NACCID": "string"}
+)
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+# 🔑 Strip time component safely
+df["Date"] = df["Date"].dt.normalize()
+
+# numeric columns
+for c in ["Ptau_217", "EDUC", "CDRSUM", "MOCATOTS", "SEX", "RACE", "AMYLOID_STATUS", "NACCAGE", "NACCAPOE", "CENTILOIDS"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# >>> NEW: treat NACCAGE == 888 as missing <<<
+if "NACCAGE" in df.columns:
+    df.loc[df["NACCAGE"] == 888, "NACCAGE"] = np.nan
+
+# >>> NEW: treat NACCAPOE == 9 as missing <<<
+if "NACCAPOE" in df.columns:
+    df.loc[df["NACCAPOE"] == 9, "NACCAPOE"] = np.nan
+
+# 1) Most recent Ptau_217 per NACCID
+ptau_rows = df.loc[df["Ptau_217"].notna(), ["NACCID", "Date", "Ptau_217"]].copy()
+ptau_rows = ptau_rows.sort_values(["NACCID", "Date"])
+ptau_latest = (
+    ptau_rows.groupby("NACCID", as_index=False).tail(1)
+    .rename(columns={"Date": "Ptau_Date"})
+)
+
+def closest_value(
+    df_long: pd.DataFrame,
+    targets: pd.DataFrame,
+    value_col: str,
+    source_filter=None,
+    require_date: bool = True,          # if False, ignore Date requirement
+    prefer: str = "latest_dated"        # only used when require_date=False
+) -> pd.DataFrame:
+    """
+    Returns per-NACCID value + a corresponding *_Date column.
+
+    require_date=True (default):
+      - uses dated rows only (Date notna)
+      - chooses value closest to targets['Ptau_Date']
+      - tie-break: more recent Date
+
+    require_date=False:
+      - chooses a non-missing value from ANY row (Date may be missing)
+      - prefer='latest_dated': if any dated rows exist for that ID, take the latest dated one;
+        otherwise take any undated non-missing value
+      - *_Date will be NaT if the chosen row has no Date
+    """
+    out = targets[["NACCID"]].copy()
+    out[value_col] = pd.NA
+    out[f"{value_col}_Date"] = pd.NaT
+
+    if value_col not in df_long.columns:
+        return out
+
+    tmp = df_long
+    if source_filter is not None:
+        tmp = tmp[source_filter(tmp)]
+
+    tmp = tmp[["NACCID", "Date", value_col]].copy()
+    tmp = tmp[tmp[value_col].notna()]
+
+    # Only keep IDs we care about
+    tmp = tmp.merge(targets[["NACCID"]], on="NACCID", how="inner")
+
+    if require_date:
+        # must have Date + must have Ptau_Date to compute closeness
+        tmp = tmp[tmp["Date"].notna()].copy()
+        tmp = tmp.merge(targets[["NACCID", "Ptau_Date"]], on="NACCID", how="inner")
+        tmp = tmp[tmp["Ptau_Date"].notna()].copy()
+
+        tmp["_absdiff"] = (tmp["Date"] - tmp["Ptau_Date"]).abs().dt.total_seconds()
+
+        # nearest first; tie-breaker = more recent measurement date
+        tmp = tmp.sort_values(["NACCID", "_absdiff", "Date"], ascending=[True, True, False])
+        best = tmp.groupby("NACCID", as_index=False).head(1)
+
+        return best[["NACCID", value_col, "Date"]].rename(columns={"Date": f"{value_col}_Date"})
+
+    # ---- require_date=False: allow Date missing ----
+    if prefer not in {"latest_dated", "any"}:
+        raise ValueError("prefer must be 'latest_dated' or 'any'")
+
+    if prefer == "latest_dated":
+        tmp["_has_date"] = tmp["Date"].notna().astype(int)
+        # prefer dated rows first, then latest date; otherwise any undated row
+        tmp = tmp.sort_values(["NACCID", "_has_date", "Date"], ascending=[True, False, False])
+        best = tmp.groupby("NACCID", as_index=False).head(1)
+    else:
+        best = tmp.groupby("NACCID", as_index=False).head(1)
+
+    return best[["NACCID", value_col, "Date"]].rename(columns={"Date": f"{value_col}_Date"})
+
+def closest_dx_with_optional_etiology(
+    df_long: pd.DataFrame,
+    targets: pd.DataFrame,
+    source_filter=None
+) -> pd.DataFrame:
+    """
+    For each NACCID, choose the row closest to Ptau_Date where madc_dx is non-missing.
+    madc_primary_etiology may be NA (e.g., Normal cognition).
+    """
+    out = targets[["NACCID"]].copy()
+    out["madc_dx"] = pd.NA
+    out["madc_primary_etiology"] = pd.NA
+    out["madc_dx_Date"] = pd.NaT
+
+    needed = ["NACCID", "Date", "madc_dx", "madc_primary_etiology"]
+    for c in needed:
+        if c not in df_long.columns:
+            return out
+
+    tmp = df_long.copy()
+
+    # Optional restriction (recommended: clinical rows only)
+    if source_filter is not None:
+        tmp = tmp[source_filter(tmp)]
+
+    # Require madc_dx only
+    tmp = tmp[
+        tmp["Date"].notna() &
+        tmp["madc_dx"].notna()
+    ][needed].copy()
+
+    tmp = tmp.merge(
+        targets[["NACCID", "Ptau_Date"]],
+        on="NACCID",
+        how="inner"
+    )
+
+    tmp["_absdiff"] = (tmp["Date"] - tmp["Ptau_Date"]).abs().dt.total_seconds()
+
+    # nearest first; tie-breaker = more recent visit
+    tmp = tmp.sort_values(
+        ["NACCID", "_absdiff", "Date"],
+        ascending=[True, True, False]
+    )
+
+    best = tmp.groupby("NACCID", as_index=False).head(1)
+    best = best.rename(columns={"Date": "madc_dx_Date"})
+
+    return best[["NACCID", "madc_dx", "madc_primary_etiology", "madc_dx_Date"]]
+
+# 3) Build one-row-per-NACCID summary at Ptau_Date
+summary = ptau_latest[["NACCID", "Ptau_Date", "Ptau_217"]].copy()
+
+# Static covariates: allow undated rows
+cols_static_anyrow = ["EDUC", "SEX", "RACE", "NACCAPOE"]
+for col in cols_static_anyrow:
+    summary = summary.merge(
+        closest_value(df, ptau_latest, col, require_date=False, prefer="latest_dated"),
+        on="NACCID",
+        how="left"
+    )
+
+# Time-varying covariates: closest to Ptau_Date (dated rows only)
+cols_timevary = ["CDRSUM", "MOCATOTS", "NACCAGE"]
+for col in cols_timevary:
+    summary = summary.merge(
+        closest_value(df, ptau_latest, col, require_date=True),
+        on="NACCID",
+        how="left"
+    )
+
+
+# Treat empty strings / whitespace as missing for these string columns
+for c in ["madc_dx", "madc_primary_etiology"]:
+    if c in df.columns:
+        df[c] = df[c].astype("string").str.strip()
+        df[c] = df[c].replace({"": pd.NA, "NA": pd.NA})
+
+summary = summary.merge(
+    closest_dx_with_optional_etiology(
+        df,
+        ptau_latest,
+        source_filter=lambda d: d["row_source"].eq("clinical")
+    ),
+    on="NACCID",
+    how="left"
+)
+
+# Pull AMYLOID_STATUS closest non-missing value from PET rows ONLY
+summary = summary.merge(
+    closest_value(df, ptau_latest, "AMYLOID_STATUS", source_filter=lambda d: d["row_source"].eq("amyloid_pet")),
+    on="NACCID",
+    how="left"
+)
+
+# Pull CENTILOIDS closest non-missing value from PET rows ONLY
+summary = summary.merge(
+    closest_value(df, ptau_latest, "CENTILOIDS", source_filter=lambda d: d["row_source"].eq("amyloid_pet")),
+    on="NACCID",
+    how="left"
+)
+
+print("Unique NACCIDs in df:", df["NACCID"].nunique())
+
+ptau_ids = df.loc[df["Ptau_217"].notna(), "NACCID"].nunique()
+print("Unique NACCIDs with any pTau row:", ptau_ids)
+
+print("Unique NACCIDs in ptau_latest:", ptau_latest["NACCID"].nunique())
+
+# After you merge in closest RACE
+print("Unique NACCIDs in summary (pre-race filter):", summary["NACCID"].nunique())
+print("RACE missing in summary:", summary["RACE"].isna().sum())
+print("RACE value counts in summary:")
+print(summary["RACE"].value_counts(dropna=False).head(20))
+
+tmp_after = summary[summary["RACE"].isin([1, 2])]
+print("Unique NACCIDs after race filter:", tmp_after["NACCID"].nunique())
+
+# Final filter: double check to keep only rows where RACE is present and in {1,2}
+summary["RACE"] = pd.to_numeric(summary["RACE"], errors="coerce")
+summary = summary[summary["RACE"].isin([1, 2])].copy()
+
+summary = summary.sort_values(["NACCID", "Ptau_Date"])
+print(summary.head())
+print("N subjects:", summary["NACCID"].nunique())
