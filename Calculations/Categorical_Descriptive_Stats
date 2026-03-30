@@ -1,0 +1,44 @@
+def categorical_test(madrc, nacc, categorical_vars):
+    rows = []
+    
+    for col in categorical_vars:
+        madrc_counts = madrc[col].value_counts(dropna=False)
+        nacc_counts = nacc[col].value_counts(dropna=False)
+        
+        # Align categories across datasets
+        cats = sorted(set(madrc_counts.index) | set(nacc_counts.index), key=lambda x: str(x))
+        madrc_vec = madrc_counts.reindex(cats, fill_value=0)
+        nacc_vec = nacc_counts.reindex(cats, fill_value=0)
+        
+        contingency = np.array([madrc_vec, nacc_vec])
+        
+        # Expected frequencies
+        chi2_stat, chi2_p, _, expected = chi2_contingency(contingency, correction=False)
+        
+        # Use Fisher Exact if any expected cell < 5 and table is 2x2
+        if contingency.shape == (2,2) and (expected < 5).any():
+            _, fisher_p = fisher_exact(contingency)
+            p = fisher_p
+            test_used = "Fisher Exact"
+        else:
+            p = chi2_p
+            test_used = "Chi-square"
+        
+        # results
+        rows.append({
+            'variable': col,
+            'categories': cats,
+            'madrc_counts': list(madrc_vec),
+            'madrc_props': (madrc_vec / madrc_vec.sum()).round(3).tolist(),
+            'nacc_counts': list(nacc_vec),
+            'nacc_props': (nacc_vec / nacc_vec.sum()).round(3).tolist(),
+            'test': test_used,
+            'p_value': p
+        })
+    
+    return pd.DataFrame(rows)
+
+cat_results = categorical_test(madrc, nacc, categorical_vars)
+print("\n=== CATEGORICAL COMPARISON WITH P-VALUES ===")
+pd.set_option('display.max_colwidth', None)
+print(cat_results)
