@@ -1,0 +1,86 @@
+import numpy as np
+import pandas as pd
+
+def mad_outlier_filter_global(
+    df: pd.DataFrame,
+    value_col: str,
+    id_col: str,
+    k: float = 9.0,                 
+    tail: str = "high",             
+    drop_negative: bool = True,
+    add_debug_cols: bool = True,
+):
+    out = df.copy()
+    out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
+
+    # Global robust center/spread
+    med = out[value_col].median(skipna=True)
+    mad = (out[value_col] - med).abs().median(skipna=True)
+
+    print(f"{value_col} global median: {med:.3f}")
+    print(f"{value_col} global MAD: {mad:.3f}")
+    if mad == 0 or np.isnan(mad):
+        print("MAD is 0/NaN; skipping MAD-based outlier detection (will only apply negative filter if enabled).")
+
+    # Robust z-score
+    out["_median"] = med
+    out["_mad"] = mad
+    out["_robust_z"] = np.where( 
+        (mad > 0) & out[value_col].notna(),
+        0.6745 * (out[value_col] - med) / mad,
+        np.nan
+    )
+
+    # Negative sanity check
+    out["_neg_flag"] = (out[value_col] < 0) if drop_negative else False
+
+    # MAD-based flag based on chosen tail
+    if mad > 0 and not np.isnan(mad):
+        if tail == "high":
+            out["_mad_outlier"] = out["_robust_z"] > k
+        elif tail == "low":
+            out["_mad_outlier"] = out["_robust_z"] < -k
+        elif tail == "both":
+            out["_mad_outlier"] = out["_robust_z"].abs() > k
+        else:
+            raise ValueError("tail must be one of: 'high', 'low', 'both'")
+    else:
+        out["_mad_outlier"] = False
+
+    out["_outlier"] = out["_neg_flag"] | out["_mad_outlier"]
+
+    outliers_df = out.loc[out["_outlier"], [id_col, value_col, "_robust_z"]].copy()
+
+    print(f"\nRemoving {len(outliers_df)} outlier rows (tail='{tail}', k={k}):")
+    if len(outliers_df) > 0:
+        print(
+            outliers_df.assign(_abs_z=outliers_df["_robust_z"].abs())
+                      .sort_values("_abs_z", ascending=False)
+                      .drop(columns="_abs_z")
+        )
+
+    cleaned = out.loc[~out["_outlier"]].copy()
+
+    if not add_debug_cols:
+        cleaned = cleaned.drop(columns=[c for c in cleaned.columns if c.startswith("_")], errors="ignore")
+        outliers_df = outliers_df[[id_col, value_col]]
+
+    return cleaned, outliers_df
+
+madrc, madrc_outliers = mad_outlier_filter_global(
+    df=madrc,
+    value_col="ptau217",
+    id_col="id",
+    k=50.0,
+    tail="high",
+    drop_negative=True
+)
+
+nacc, nacc_outliers = mad_outlier_filter_global(
+    df=nacc,
+    value_col="ptau217",
+    id_col="naccid",
+    k=50.0,
+    tail="high",
+    drop_negative=True
+)
