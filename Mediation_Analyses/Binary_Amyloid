@@ -1,0 +1,187 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from sklearn.utils import resample
+
+# Set categoricals
+analysis_df["madc_dx"] = analysis_df["madc_dx"].astype("category")
+analysis_df["sex"] = analysis_df["sex"].astype("category")
+analysis_df["apoe_pos"] = analysis_df["apoe_pos"].astype("category")
+analysis_df["educ_group"] = analysis_df["educ_group"].astype("category")
+analysis_df["dataset"] = analysis_df["dataset"].astype("category")
+
+# Keep only rows with no missing in variables needed for mediation
+covariates = ["age", "sex", "apoe_pos", "educ_group", "dataset", "madc_dx"]
+
+needed = ["log_ptau217", "race_black", "amyloid_status_num"] + covariates
+df_med = analysis_df.dropna(subset=needed).copy()
+
+def mediation_binary(
+    data,
+    exposure="race_black",
+    mediator="amyloid_status_num",
+    outcome="log_ptau217",
+    covariates=None,
+    n_boot=1000,
+    random_state=42
+):
+    """
+    Binary mediator (0/1), continuous outcome, binary exposure (0/1).
+    Returns ACME_0, ACME_1, ADE_0, ADE_1, Total, with bootstrap CIs.
+    """
+    if covariates is None:
+        covariates = []
+
+    rng = np.random.default_rng(random_state)
+
+    # ---------- Helper: core estimation ----------
+    def _estimate_effects(df):
+        # 1) Fit mediator model: logit(M | X, C)
+        med_formula = f"{mediator} ~ {exposure}"
+        if covariates:
+            med_formula += " + " + " + ".join(covariates)
+
+        med_fit = smf.glm(
+            med_formula,
+            data=df,
+            family=sm.families.Binomial()
+        ).fit()
+
+        # 2) Fit outcome model: Y | X, M, C
+        out_formula = f"{outcome} ~ {exposure} + {mediator}"
+        if covariates:
+            out_formula += " + " + " + ".join(covariates)
+
+        out_fit = smf.ols(out_formula, data=df).fit()
+
+        # 3) Compute required predictions for each subject
+        df0 = df.copy()
+        df1 = df.copy()
+
+        # Create copies for X=0 and X=1
+        df0[exposure] = 0
+        df1[exposure] = 1
+
+        # Predicted P(M=1 | X=x, C)
+        pM1_x0 = med_fit.predict(df0)
+        pM1_x1 = med_fit.predict(df1)
+        pM0_x0 = 1 - pM1_x0
+        pM0_x1 = 1 - pM1_x1
+
+        # For outcome model, E[Y | X=x, M=m, C]
+        def y_hat(df_base, x_val, m_val):
+            temp = df_base.copy()
+            temp[exposure] = x_val
+            temp[mediator] = m_val
+            return out_fit.predict(temp)
+
+        # E[Y | X=x, M=0, C] and E[Y | X=x, M=1, C]
+        y_x0_m0 = y_hat(df, 0, 0)
+        y_x0_m1 = y_hat(df, 0, 1)
+        y_x1_m0 = y_hat(df, 1, 0)
+        y_x1_m1 = y_hat(df, 1, 1)
+
+        # Compute four counterfactual means per Imai et al.
+        # mu_ab = E[Y( X=a, M(X=b) )]
+
+        # Y(1, M(1)) and Y(1, M(0))
+        mu_11 = y_x1_m1 * pM1_x1 + y_x1_m0 * pM0_x1
+        mu_10 = y_x1_m1 * pM1_x0 + y_x1_m0 * pM0_x0
+
+        # Y(0, M(1)) and Y(0, M(0))
+        mu_01 = y_x0_m1 * pM1_x1 + y_x0_m0 * pM0_x1
+        mu_00 = y_x0_m1 * pM1_x0 + y_x0_m0 * pM0_x0
+
+        # ACME and ADE
+        ACME_0 = np.mean(mu_01 - mu_00)
+        ACME_1 = np.mean(mu_11 - mu_10)
+        ADE_0 = np.mean(mu_10 - mu_00)
+        ADE_1 = np.mean(mu_11 - mu_01)
+        Total = np.mean(mu_11 - mu_00)
+
+        return {
+            "ACME_0": ACME_0,
+            "ACME_1": ACME_1,
+            "ADE_0": ADE_0,
+            "ADE_1": ADE_1,
+            "Total": Total,
+        }
+
+    # ---------- Point estimates ----------
+    point_est = _estimate_effects(data)
+
+    # ---------- Bootstrap ----------
+    boot_stats = {k: [] for k in point_est.keys()}
+
+    for _ in range(n_boot):
+        df_bs = resample(data, replace=True, random_state=rng.integers(0, 1e9))
+        try:
+            est_bs = _estimate_effects(df_bs)
+            for k in boot_stats:
+                boot_stats[k].append(est_bs[k])
+        except Exception:
+            # In case of separation or convergence issues, skip this bootstrap
+            continue
+
+    def ci(vals, alpha=0.05):
+        vals = np.array(vals)
+        return np.nanpercentile(vals, 100 * alpha / 2), np.nanpercentile(
+            vals, 100 * (1 - alpha / 2)
+        )
+
+    results = {}
+    for k, v in point_est.items():
+        results[k] = {
+            "estimate": v,
+            "CI_95": ci(boot_stats[k]) if len(boot_stats[k]) > 20 else (np.nan, np.nan)
+        }
+
+    # Proportion mediated (using ACME_0 and Total as default)
+    if point_est["Total"] != 0:
+        prop_med_0 = point_est["ACME_0"] / point_est["Total"]
+        prop_med_1 = point_est["ACME_1"] / point_est["Total"]
+    else:
+        prop_med_0 = np.nan
+        prop_med_1 = np.nan
+
+    results["Prop_med_0"] = {
+        "estimate": prop_med_0,
+        "CI_95": ci(
+            [
+                a / t if t != 0 else np.nan
+                for a, t in zip(boot_stats["ACME_0"], boot_stats["Total"])
+            ]
+        )
+        if len(boot_stats["ACME_0"]) > 20
+        else (np.nan, np.nan),
+    }
+
+    results["Prop_med_1"] = {
+        "estimate": prop_med_1,
+        "CI_95": ci(
+            [
+                a / t if t != 0 else np.nan
+                for a, t in zip(boot_stats["ACME_1"], boot_stats["Total"])
+            ]
+        )
+        if len(boot_stats["ACME_1"]) > 20
+        else (np.nan, np.nan),
+    }
+
+    return results
+
+covariates = ["age", "sex", "apoe_pos", "educ_group", "dataset", "madc_dx"]
+
+med_results = mediation_binary(
+    df_med,
+    exposure="race_black",
+    mediator="amyloid_status_num",
+    outcome="log_ptau217",
+    covariates=covariates,
+    n_boot=1000,       
+    random_state=2026
+)
+
+import pprint
+pprint.pp(med_results)
