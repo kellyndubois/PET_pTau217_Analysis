@@ -1,0 +1,59 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import statsmodels.formula.api as smf
+
+# ------------- Prep data -------------
+df = analysis_df.copy()
+
+# ensure numeric
+df["centiloids"] = pd.to_numeric(df["centiloids"], errors="coerce")
+df["log_ptau217"]    = pd.to_numeric(df["log_ptau217"],    errors="coerce")
+
+# drop rows missing key vars
+df_plot = df.dropna(subset=["centiloids", "ptau217", "race_black"]).copy()
+
+# categorical label for plotting
+df_plot["race_group"] = df_plot["race_black"].map({0: "NHW", 1: "B/AA"})
+df_plot["race_group"] = df_plot["race_group"].astype("category")
+
+# ------------- Plot with separate regression lines -------------
+sns.set(style="whitegrid")
+
+g = sns.lmplot(
+    data=df_plot,
+    x="centiloids",
+    y="log_ptau217",
+    hue="race_group",
+    markers=["o", "s"],
+    palette="Set1",
+    height=5,
+    aspect=1.4,
+    scatter_kws={"alpha": 0.6, "s": 40},
+    line_kws={"linewidth": 2}
+)
+
+g.set_axis_labels("Centiloids", "ln(Plasma pTau-217)")
+g.fig.suptitle("pTau-217 vs Centiloids by Race", y=1.02)
+
+# Move legend 
+g._legend.set_title("Race")
+g._legend.set_bbox_to_anchor((0.8, 0.5))
+g._legend.set_loc("center left")
+g.fig.subplots_adjust(right=0.8)
+
+# ---- Save files ----
+g.fig.savefig(
+    "ptau217_vs_centiloids_by_race_recodedamyloid.jpg",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+g.fig.savefig(
+    "ptau217_vs_centiloids_by_race_recodedamyloid.tif",
+    dpi=300,
+    format="tiff",
+    bbox_inches="tight"
+)
+
+plt.show()
