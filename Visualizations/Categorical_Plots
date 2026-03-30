@@ -1,0 +1,62 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----- Panel geometry (inches) -----
+inner = 3.0        # size of the actual plotting square
+left  = 0.75       # margin for y-axis label + ticks
+bottom = 0.75      # margin for x-axis label + ticks
+right = 0.25
+top   = 0.40
+
+fig_w = left + inner + right
+fig_h = bottom + inner + top
+
+# Output directory for categorical plots
+cat_out_dir = "output_directory"
+os.makedirs(cat_out_dir, exist_ok=True)
+
+for col in categorical_vars:
+    # Build proportion table (rows=categories, cols=cohorts)
+    plot_df = pd.concat([
+        madrc[col].value_counts(normalize=True).rename("MADRC"),
+        nacc[col].value_counts(normalize=True).rename("NACC")
+    ], axis=1).fillna(0)
+
+    # ----- Create figure and fixed-size axes -----
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=300)
+    ax = fig.add_axes([
+        left / fig_w,
+        bottom / fig_h,
+        inner / fig_w,
+        inner / fig_h
+    ])  # this inner region is exactly `inner` x `inner` inches
+
+    # Plot bars
+    plot_df.plot(kind="bar", ax=ax)
+
+    # Remove gridlines
+    ax.grid(False)
+
+    # Force y-axis ticks + labels (0–1)
+    yticks = np.linspace(0, 1, 6)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{y:.1f}" for y in yticks])
+    ax.yaxis.set_ticks_position("left")
+    ax.tick_params(axis="y", which="major", left=True, length=6, width=1)
+
+    ax.set_ylabel("Proportion")
+    ax.set_xlabel(col)
+    ax.set_title(f"Categorical Composition: {col}")
+
+    # File names
+    base_filename = f"{col}_categorical_composition"
+    tif_path = os.path.join(cat_out_dir, f"{base_filename}.tif")
+    jpg_path = os.path.join(cat_out_dir, f"{base_filename}.jpg")
+
+    fig.savefig(tif_path, dpi=300, format="tiff", bbox_inches="tight")
+    fig.savefig(jpg_path, dpi=300, format="jpg",  bbox_inches="tight")
+
+    print(f"Saved {tif_path} and {jpg_path}")
+    plt.show()
+    plt.close(fig)
