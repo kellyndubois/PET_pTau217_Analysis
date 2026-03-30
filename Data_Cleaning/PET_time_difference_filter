@@ -1,0 +1,106 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+CSV_PATH = Path("dataframe.csv").expanduser()
+
+DATE_FORMAT = None   # blood draw Date
+PET_FORMAT  = None   # amyloid_pet_date
+
+MAX_DAYS = 1095  # 3 years
+
+# -----------------------------
+# Load
+# -----------------------------
+df = pd.read_csv(CSV_PATH)
+df = df.rename(columns={c: c.strip() for c in df.columns})
+
+required_cols = {"stim_id", "ID", "Date", "amyloid_pet_date"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+# Parse dates
+df["Date"] = pd.to_datetime(df["Date"], format=DATE_FORMAT, errors="coerce")
+df["amyloid_pet_date"] = pd.to_datetime(df["amyloid_pet_date"], format=PET_FORMAT, errors="coerce")
+
+# Build person key: ID if present else stim_id
+df["use_id"] = df["ID"].where(df["ID"].notna(), df["stim_id"])
+
+# -----------------------------
+# PASS 1: compute diffs on usable rows
+# -----------------------------
+usable = df.dropna(subset=["use_id", "Date", "amyloid_pet_date"]).copy()
+
+# If multiple rows per person, keep earliest draw (your original behavior)
+usable = usable.sort_values(["use_id", "Date"])
+first_per_id = usable.drop_duplicates(subset=["use_id"], keep="first").copy()
+
+first_per_id["days_diff_signed"] = (first_per_id["amyloid_pet_date"] - first_per_id["Date"]).dt.days
+first_per_id["days_diff_abs"] = first_per_id["days_diff_signed"].abs()
+
+# Identify IDs to invalidate
+bad_ids = set(first_per_id.loc[first_per_id["days_diff_abs"] > MAX_DAYS, "use_id"])
+
+print(f"People with abs(PET-draw) > {MAX_DAYS} days: {len(bad_ids)}")
+
+# -----------------------------
+# Invalidate amyloid + centiloids (and PET date so rerun excludes them)
+# -----------------------------
+# Find relevant columns if present
+amyloid_col_candidates = ["amyloid_status", "AMYLOID_STATUS"]
+cent_col_candidates = ["CENTILOIDS", "Centiloids", "centiloids"]
+
+amyloid_col = next((c for c in amyloid_col_candidates if c in df.columns), None)
+cent_col = next((c for c in cent_col_candidates if c in df.columns), None)
+
+mask_bad = df["use_id"].isin(bad_ids)
+
+if amyloid_col is not None:
+    df.loc[mask_bad, amyloid_col] = np.nan
+if cent_col is not None:
+    df.loc[mask_bad, cent_col] = np.nan
+
+# also blank PET date so the rerun time-diff drops these
+df.loc[mask_bad, "amyloid_pet_date"] = pd.NaT
+
+# -----------------------------
+# PASS 2: rerun diffs after invalidation
+# -----------------------------
+usable2 = df.dropna(subset=["use_id", "Date", "amyloid_pet_date"]).copy()
+usable2 = usable2.sort_values(["use_id", "Date"])
+first_per_id2 = usable2.drop_duplicates(subset=["use_id"], keep="first").copy()
+
+first_per_id2["days_diff_signed"] = (first_per_id2["amyloid_pet_date"] - first_per_id2["Date"]).dt.days
+first_per_id2["days_diff_abs"] = first_per_id2["days_diff_signed"].abs()
+
+def summarize(series: pd.Series) -> pd.Series:
+    desc = series.describe(percentiles=[0.25, 0.5, 0.75])
+    q1, q3 = desc["25%"], desc["75%"]
+    iqr = q3 - q1
+    return pd.Series({
+        "n": int(desc["count"]),
+        "min": float(desc["min"]),
+        "q1": float(q1),
+        "median": float(desc["50%"]),
+        "q3": float(q3),
+        "max": float(desc["max"]),
+        "mean": float(desc["mean"]),
+        "std": float(desc["std"]),
+        "IQR": float(iqr),
+    })
+
+print("\n=== MADRC AFTER invalidation: SIGNED days ===")
+print(summarize(first_per_id2["days_diff_signed"]).to_frame("days").T.round(2))
+
+print("\n=== MADRC AFTER invalidation: ABS days ===")
+print(summarize(first_per_id2["days_diff_abs"]).to_frame("days").T.round(2))
+
+# Save updated main file + audit diffs
+updated_path = CSV_PATH.with_name(CSV_PATH.stem + "_PETwithin3y.csv")
+df.to_csv(updated_path, index=False)
+print(f"\nSaved updated MADRC file to: {updated_path}")
+
+audit_path = CSV_PATH.with_name("outfile.csv")
+first_per_id2[["stim_id", "ID", "use_id", "Date", "amyloid_pet_date", "days_diff_signed", "days_diff_abs"]].to_csv(audit_path, index=False)
+print(f"Saved MADRC audit diffs to: {audit_path}")
