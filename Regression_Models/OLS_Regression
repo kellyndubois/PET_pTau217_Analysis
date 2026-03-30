@@ -20,6 +20,17 @@ formula_pet = (
 formula_centiloids = (
     f"log_ptau217 ~ race_black * centiloids + {cov_str}"
 )
+formula_dx = (
+    "log_ptau217 ~ race_black * C(madc_dx) "
+    "+ race_black * apoe_pos "
+    f"+ age + sex + educ_group + dataset"
+)
+formula_pet = (
+    f"log_ptau217 ~ race_black * amyloid_status_num + race_black * apoe_pos + {cov_str}"
+)
+formula_centiloids = (
+    f"log_ptau217 ~ race_black * centiloids + race_black * apoe_pos + {cov_str}"
+)
 
 # 4) Fit model
 model_dx = smf.ols(formula_dx, data=analysis_df).fit()
