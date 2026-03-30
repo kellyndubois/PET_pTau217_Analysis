@@ -1,0 +1,49 @@
+import numpy as np
+import pandas as pd
+
+def smd_numeric(madrc, nacc, numeric_vars):
+    rows = []
+    for col in numeric_vars:
+        # Skip or flag if column missing in either dataset
+        if col not in madrc.columns or col not in nacc.columns:
+            rows.append({
+                'variable': col,
+                'SMD': np.nan,
+                'note': 'missing in one of the datasets'
+            })
+            continue
+
+        # Coerce to numeric and drop NaNs
+        x = pd.to_numeric(bal[col], errors='coerce').dropna()
+        y = pd.to_numeric(nacc[col], errors='coerce').dropna()
+
+        # Need at least 2 values per group to compute variance
+        if len(x) < 2 or len(y) < 2:
+            rows.append({
+                'variable': col,
+                'SMD': np.nan,
+                'note': 'not enough non-missing numeric data'
+            })
+            continue
+
+        # Pooled SD
+        pooled_sd = np.sqrt((np.var(x, ddof=1) + np.var(y, ddof=1)) / 2)
+
+        if pooled_sd == 0:
+            smd = np.nan
+            note = 'pooled SD = 0'
+        else:
+            smd = (np.mean(x) - np.mean(y)) / pooled_sd
+            note = ''
+
+        rows.append({
+            'variable': col,
+            'SMD': smd,
+            'note': note
+        })
+
+    return pd.DataFrame(rows)
+
+smd_num = smd_numeric(madrc, nacc, numeric_vars)
+print("\n=== STANDARDIZED MEAN DIFFERENCE (NUMERIC) ===")
+print(smd_num)
