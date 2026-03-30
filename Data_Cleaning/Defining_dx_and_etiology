@@ -1,0 +1,226 @@
+import numpy as np
+import pandas as pd
+
+#Defining Dx and Etiology in NACC dataset the same way they are defined in MADRC dataset
+
+def get_madc_dx_etiologies(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - madc_dx
+      - Lang, Att, Exec, VS
+      - Domains (comma-separated)
+      - madc_primary_etiology
+    """
+    out = df.copy()
+
+    # ----------------------------
+    # Helper to safely treat missing columns as False
+    # ----------------------------
+    def col_true(colname: str) -> pd.Series:
+        if colname not in out.columns:
+            return pd.Series(False, index=out.index)
+        s = out[colname]
+        # handle 0/1, bool, strings like "1"
+        return pd.to_numeric(s, errors="coerce").fillna(0).astype(int).eq(1)
+
+    def col_eq(colname: str, value: int) -> pd.Series:
+        if colname not in out.columns:
+            return pd.Series(False, index=out.index)
+        return pd.to_numeric(out[colname], errors="coerce").eq(value)
+
+    # ----------------------------
+    # MADC Diagnosis (madc_dx)
+    # ----------------------------
+    conditions_dx = [
+        col_true("NORMCOG").eq(True),
+        (~col_true("NORMCOG")) & col_true("DEMENTED") & col_true("AMNDEM"),
+        (~col_true("NORMCOG")) & col_true("DEMENTED") & col_true("PCA"),
+        (col_true("NORMCOG")) & col_true("DEMENTED") & (col_true("NACCPPA") | col_true("NACCPPAG") | col_true("NACCPPME")),
+        (~col_true("NORMCOG")) & col_true("DEMENTED") & col_true("NACCBVFT"),
+        (~col_true("NORMCOG")) & col_true("DEMENTED") & col_true("NACCLBDS"),
+        (~col_true("NORMCOG")) & col_true("DEMENTED") & col_true("NAMNDEM"),
+        (~col_true("NORMCOG")) & (~col_true("DEMENTED")) & col_eq("NACCTMCI", 1),
+        (~col_true("NORMCOG")) & (~col_true("DEMENTED")) & col_eq("NACCTMCI", 2),
+        (~col_true("NORMCOG")) & (~col_true("DEMENTED")) & col_eq("NACCTMCI", 3),
+        (~col_true("NORMCOG")) & (~col_true("DEMENTED")) & col_eq("NACCTMCI", 4),
+        (~col_true("NORMCOG")) & (~col_true("DEMENTED")) & col_true("IMPNOMCI"),
+    ]
+    choices_dx = [
+        "Normal",
+        "Amnestic multidomain dementia syndrome",
+        "Posterior cortical atrophy syndrome (or primary visual presentation)",
+        "Primary progressive aphasia (PPA) syndrome",
+        "Behavioral variant FTD (bvFTD) syndrome",
+        "Lewy body dementia syndrome",
+        "Non-amnestic multidomain dementia, not PCA, PPA, bvFTD, or DLB syndrome",
+        "Amnestic MCI-single domain",
+        "Amnestic MCI-multiple domains",
+        "Non-amnestic MCI-single domain",
+        "Non-amnestic MCI-multiple domains",
+        "Cognitively impaired, not MCI",
+    ]
+    out["madc_dx"] = pd.Series(
+    np.select(conditions_dx, choices_dx, default=pd.NA),
+    index=out.index,
+    dtype="string"
+    )
+
+    # ----------------------------
+    # Domain labels (Lang/Att/Exec/VS)
+    # ----------------------------
+    out["Lang"] = pd.Series(np.where(col_true("NACCMCIL"), "Language", ""), index=out.index, dtype="string")
+    out["Att"]  = pd.Series(np.where(col_true("NACCMCIA"), "Attention", ""), index=out.index, dtype="string")
+    out["Exec"] = pd.Series(np.where(col_true("NACCMCIE"), "Executive", ""), index=out.index, dtype="string")
+    out["VS"]   = pd.Series(np.where(col_true("NACCMCIV"), "Visuospatial", ""), index=out.index, dtype="string")
+
+
+    # Build "Domains" like str_c(..., sep=", "), but skip blanks
+    out["Domains"] = (
+        out[["Lang", "Att", "Exec", "VS"]]
+        .replace("", pd.NA)
+        .agg(lambda row: ", ".join([v for v in row.dropna().astype(str)]), axis=1)
+    )
+    
+    # --- inside get_madc_dx_etiologies(), after out = df.copy() ---
+    
+    # 1) First compute the OLD flag-based etiology (your existing logic)
+    conditions_et = [
+        col_true("NACCALZD") & col_true("NACCALZP"),
+        col_true("NACCLBDE") & col_true("NACCLBDP") & (~col_true("PARK")),
+        col_true("NACCLBDE") & col_true("NACCLBDP") & col_true("PARK"),
+        col_true("MSA") & col_true("MSAIF"),
+        col_true("PSP") & col_true("PSPIF"),
+        col_true("CORT") & col_true("CORTIF"),
+        col_true("FTLDMO") & col_true("FTLDMOIF"),
+        col_true("FTLDNOS") & col_true("FTLDNOIF"),
+        col_true("FTD") & col_true("FTDIF"),
+        col_true("CVD") & col_true("CVDIF"),
+        col_true("ESSTREM") & col_true("ESSTREIF"),
+        col_true("DOWNS") & col_true("DOWNSIF"),
+        col_true("HUNT") & col_true("HUNTIF"),
+        col_true("PRION") & col_true("PRIONIF"),
+        col_true("BRNINJ") & col_true("BRNINJIF"),
+        col_true("HYCEPH") & col_true("HYCEPHIF"),
+        col_true("EPILEP") & col_true("EPILEPIF"),
+        col_true("NEOP") & col_true("NEOPIF"),
+        col_true("HIV") & col_true("HIVIF"),
+        col_true("OTHCOG") & col_true("OTHCOGIF"),
+        col_true("DEP") & col_true("DEPIF"),
+        col_true("BIPOLDX") & col_true("BIPOLDIF"),
+        col_true("SCHIZOP") & col_true("SCHIZOIF"),
+        col_true("ANXIET") & col_true("ANXIETIF"),
+        col_true("DELIR") & col_true("DELIRIF"),
+        col_true("PTSDDX") & col_true("PTSDDXIF"),
+        col_true("OTHPSY") & col_true("OTHPSYIF"),
+        col_true("ALCDEM") & col_true("ALCDEMIF"),
+        col_true("IMPSUB") & col_true("IMPSUBIF"),
+        col_true("DYSILL") & col_true("DYSILLIF"),
+        col_true("MEDS") & col_true("MEDSIF"),
+        col_true("COGOTH") & col_true("COGOTHIF"),
+        col_true("COGOTH2") & col_true("COGOTH2F"),
+        col_true("COGOTH3") & col_true("COGOTH3F"),
+    ]
+    choices_et = [
+        "Alzheimer's disease (AD)",
+        "Lewy body disease (LBD)",
+        "Parkinson's disease",
+        "Multiple system atrophy (MSA)",
+        "Progressive supranuclear palsy (PSP)",
+        "Corticobasal degeneration (CBD)",
+        "FTLD with motor neuron disease (e.g., ALS)",
+        "FTLD, other",
+        "behavioral variant FTD",
+        "Vascular brain injury or vascular dementia including stroke",
+        "Essential tremor",
+        "Down syndrome",
+        "Huntington’s disease",
+        "Prion disease (CJD, other)",
+        "Traumatic brain injury (TBI)",
+        "Normal-pressure hydrocephalus (NPH)",
+        "Epilepsy",
+        "CNS neoplasm",
+        "Human immunodeficiency virus (HIV)",
+        "Other neurologic, genetic, or infectious condition",
+        "Depression",
+        "Bipolar disorder",
+        "Schizophrenia or other psychosis",
+        "Anxiety disorder",
+        "Delirium",
+        "Post-traumatic stress disorder (PTSD)",
+        "Other psychiatric disease",
+        "Cognitive impairment due to alcohol abuse",
+        "Cognitive impairment due to other substance abuse",
+        "Cognitive impairment due to systemic disease or medical illness",
+        "Cognitive impairment due to medications",
+        "Cognitive impairment for other specified reasons (written-in)",
+        "Cognitive impairment for other specified reasons (written-in)",
+        "Cognitive impairment for other specified reasons (written-in)",
+    ]
+    
+    etiology_flags = pd.Series(
+        np.select(conditions_et, choices_et, default=pd.NA),
+        index=out.index,
+        dtype="string"
+    )
+    
+    # 2) Compute ETPR-based etiology (preferred when available)
+    etiology_map = {
+        1:  "Alzheimer's disease (AD)",
+        2:  "Lewy body disease (LBD)",
+        3:  "Multiple system atrophy (MSA)",
+        4:  "Progressive supranuclear palsy (PSP)",
+        5:  "Corticobasal degeneration (CBD)",
+        6:  "FTLD with motor neuron disease (e.g., ALS)",
+        7:  "FTLD, other",
+        8:  "Vascular brain injury or vascular dementia including stroke",
+        9:  "Essential tremor",
+        10: "Down syndrome",
+        11: "Huntington’s disease",
+        12: "Prion disease (CJD, other)",
+        13: "Traumatic brain injury (TBI)",
+        14: "Normal-pressure hydrocephalus (NPH)",
+        15: "Epilepsy",
+        16: "CNS neoplasm",
+        17: "Human immunodeficiency virus (HIV)",
+        18: "Other neurologic, genetic, or infectious condition",
+        19: "Depression",
+        20: "Bipolar disorder",
+        21: "Schizophrenia or other psychosis",
+        22: "Anxiety disorder",
+        23: "Delirium",
+        24: "Post-traumatic stress disorder (PTSD)",
+        25: "Other psychiatric disease",
+        26: "Cognitive impairment due to alcohol abuse",
+        27: "Cognitive impairment due to other substance abuse",
+        28: "Cognitive impairment due to systemic disease or medical illness",
+        29: "Cognitive impairment due to medications",
+        30: "Cognitive impairment for other specified reasons (written-in)",
+    }
+    
+    if "NACCETPR" in out.columns:
+        etpr = pd.to_numeric(out["NACCETPR"], errors="coerce")
+        etiology_etpr = (
+            etpr.replace({88: np.nan, 99: np.nan})
+                .map(etiology_map)
+                .astype("string")
+        )
+    else:
+        etiology_etpr = pd.Series(pd.NA, index=out.index, dtype="string")
+    
+    # 3) Prefer ETPR when available; else fall back to old logic
+    out["madc_primary_etiology"] = etiology_etpr.combine_first(etiology_flags)
+
+    return out
+
+
+# ----------------------------
+# Call with dataframe
+# ----------------------------
+df = pd.read_csv("nacc_dataset.csv")
+df2 = get_madc_dx_etiologies(df)
+print(df2[["madc_dx", "Domains", "madc_primary_etiology"]].head())
+df2.to_csv(
+    "nacc_dataset_dx.csv",
+    index=False,
+    na_rep="NA"
+)
