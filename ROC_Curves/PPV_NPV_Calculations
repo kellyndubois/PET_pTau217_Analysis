@@ -1,0 +1,390 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import roc_curve, roc_auc_score
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+DX_COL      = "madc_dx"         # diagnosis column
+DATASET_COL = "dataset"         # "MADRC" / "NACC"
+RACE_COL    = "race_black"      # 0=White, 1=Black
+SCORE_COL   = "ptau217"         
+POS_LABEL   = "DAT"
+NEG_LABEL   = "CU"
+
+N_BOOT_CI   = 2000              # for AUC CI + p-value tests
+RANDOM_SEED = 2026
+
+# -----------------------------
+# Helper: bootstrap AUC CI
+# -----------------------------
+def bootstrap_auc_ci(y, score, n_boot=2000, seed=2026):
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    score = np.asarray(score)
+
+    # must have both classes
+    if len(np.unique(y)) < 2:
+        return np.nan, (np.nan, np.nan), np.array([])
+
+    auc_point = roc_auc_score(y, score)
+
+    auc_boot = []
+    n = len(y)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        y_b = y[idx]
+        s_b = score[idx]
+        # skip resamples with single class
+        if len(np.unique(y_b)) < 2:
+            continue
+        auc_boot.append(roc_auc_score(y_b, s_b))
+
+    auc_boot = np.array(auc_boot)
+    if len(auc_boot) < 50:
+        return auc_point, (np.nan, np.nan), auc_boot
+
+    lo, hi = np.percentile(auc_boot, [2.5, 97.5])
+    return auc_point, (lo, hi), auc_boot
+
+# -----------------------------
+# Helper: bootstrap p-value for difference in AUCs (independent groups)
+# -----------------------------
+def bootstrap_auc_diff_pvalue(y1, s1, y2, s2, n_boot=2000, seed=2026):
+    rng = np.random.default_rng(seed)
+    y1 = np.asarray(y1); s1 = np.asarray(s1)
+    y2 = np.asarray(y2); s2 = np.asarray(s2)
+
+    # point estimate
+    if len(np.unique(y1)) < 2 or len(np.unique(y2)) < 2:
+        return np.nan, np.nan
+
+    auc1 = roc_auc_score(y1, s1)
+    auc2 = roc_auc_score(y2, s2)
+    diff_point = auc1 - auc2
+
+    diffs = []
+    n1 = len(y1); n2 = len(y2)
+
+    for _ in range(n_boot):
+        idx1 = rng.integers(0, n1, n1)
+        idx2 = rng.integers(0, n2, n2)
+        y1b, s1b = y1[idx1], s1[idx1]
+        y2b, s2b = y2[idx2], s2[idx2]
+        if len(np.unique(y1b)) < 2 or len(np.unique(y2b)) < 2:
+            continue
+        diffs.append(roc_auc_score(y1b, s1b) - roc_auc_score(y2b, s2b))
+
+    diffs = np.array(diffs)
+    if len(diffs) < 50:
+        return diff_point, np.nan
+
+    # two-sided p-value for H0: diff = 0 using bootstrap distribution
+    p = 2 * min(np.mean(diffs <= 0), np.mean(diffs >= 0))
+    return diff_point, p
+
+# -----------------------------
+# Helper: Youden J cutoff
+# -----------------------------
+def youden_cutoff(y, score):
+    y = np.asarray(y).astype(int)
+    score = np.asarray(score)
+
+    fpr, tpr, thr = roc_curve(y, score)
+    j = tpr - fpr
+    k = np.nanargmax(j)
+
+    return {
+        "cutoff_youden": thr[k],
+        "sensitivity": tpr[k],
+        "specificity": 1 - fpr[k],
+    }
+
+def confusion_from_cutoff(y, score, cutoff):
+    y = np.asarray(y).astype(int)
+    score = np.asarray(score)
+
+    pred_pos = score >= cutoff
+
+    TP = np.sum((pred_pos == 1) & (y == 1))
+    FP = np.sum((pred_pos == 1) & (y == 0))
+    TN = np.sum((pred_pos == 0) & (y == 0))
+    FN = np.sum((pred_pos == 0) & (y == 1))
+
+    sens = TP / (TP + FN) if (TP + FN) > 0 else np.nan
+    spec = TN / (TN + FP) if (TN + FP) > 0 else np.nan
+
+    # Prevalence in THIS subgroup sample
+    prev = y.mean() if len(y) else np.nan
+
+    # PPV/NPV via Bayes (equivalent to TP/(TP+FP), TN/(TN+FN) for the sample,
+    # but Bayes form makes the dependence on prevalence explicit)
+    ppv = (sens * prev) / (sens * prev + (1 - spec) * (1 - prev)) if np.isfinite(prev) else np.nan
+    npv = (spec * (1 - prev)) / ((1 - sens) * prev + spec * (1 - prev)) if np.isfinite(prev) else np.nan
+
+    return {
+        "TP": int(TP), "FP": int(FP), "TN": int(TN), "FN": int(FN),
+        "prevalence": float(prev),
+        "sensitivity": float(sens),
+        "specificity": float(spec),
+        "PPV": float(ppv),
+        "NPV": float(npv),
+    }
+
+def bootstrap_ppv_npv_ci(
+    y, score,
+    n_boot=2000,
+    seed=2026,
+    ci=(2.5, 97.5),
+    recompute_cutoff_each_boot=True,
+    fixed_cutoff=None,
+    min_valid=100,
+):
+    """
+    Bootstrap percentile CI for PPV/NPV.
+
+    By default, recomputes the Youden cutoff in each bootstrap sample
+    (includes cutoff uncertainty). 
+    """
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y).astype(int)
+    score = np.asarray(score)
+
+    n = len(y)
+    if n < 10 or len(np.unique(y)) < 2:
+        return {
+            "ppv_ci_low": np.nan, "ppv_ci_high": np.nan,
+            "npv_ci_low": np.nan, "npv_ci_high": np.nan,
+            "n_boot_valid": 0
+        }
+
+    if (not recompute_cutoff_each_boot) and (fixed_cutoff is None):
+        raise ValueError("Provide fixed_cutoff when recompute_cutoff_each_boot=False")
+
+    ppv_boot = []
+    npv_boot = []
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        y_b = y[idx]
+        s_b = score[idx]
+
+        # skip resamples missing a class
+        if len(np.unique(y_b)) < 2:
+            continue
+
+        if recompute_cutoff_each_boot:
+            cut = youden_cutoff(y_b, s_b)["cutoff_youden"]
+        else:
+            cut = fixed_cutoff
+
+        stats = confusion_from_cutoff(y_b, s_b, cut)
+        if np.isfinite(stats["PPV"]) and np.isfinite(stats["NPV"]):
+            ppv_boot.append(stats["PPV"])
+            npv_boot.append(stats["NPV"])
+
+    ppv_boot = np.asarray(ppv_boot)
+    npv_boot = np.asarray(npv_boot)
+
+    if len(ppv_boot) < min_valid or len(npv_boot) < min_valid:
+        return {
+            "ppv_ci_low": np.nan, "ppv_ci_high": np.nan,
+            "npv_ci_low": np.nan, "npv_ci_high": np.nan,
+            "n_boot_valid": int(min(len(ppv_boot), len(npv_boot)))
+        }
+
+    lo, hi = ci
+    return {
+        "ppv_ci_low": float(np.percentile(ppv_boot, lo)),
+        "ppv_ci_high": float(np.percentile(ppv_boot, hi)),
+        "npv_ci_low": float(np.percentile(npv_boot, lo)),
+        "npv_ci_high": float(np.percentile(npv_boot, hi)),
+        "n_boot_valid": int(min(len(ppv_boot), len(npv_boot)))
+    }
+
+# -----------------------------
+# Main analysis function
+# -----------------------------
+def run_roc_by_dataset_and_race(df, make_plots=True, out_dir="roc_outputs"):
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Keep CU and DAT only
+    d = df.copy()
+    d = d[d[DX_COL].isin([NEG_LABEL, POS_LABEL])].copy()
+
+    # Outcome: 1=DAT, 0=CU
+    d["y"] = (d[DX_COL] == POS_LABEL).astype(int)
+
+    # Numeric score
+    d[SCORE_COL] = pd.to_numeric(d[SCORE_COL], errors="coerce")
+
+    # Race label
+    d["race_group"] = d[RACE_COL].map({0: "NHW", 1: "B/AA"})
+    d["race_group"] = d["race_group"].astype("category")
+
+    # Datasets to evaluate
+    dataset_levels = ["MADRC", "NACC", "Combined"]
+
+    results_rows = []
+
+    for ds in dataset_levels:
+        if ds == "Combined":
+            sub = d.copy()
+        else:
+            sub = d[d[DATASET_COL] == ds].copy()
+
+        # Prepare a ROC plot per dataset
+        fig, ax = None, None
+        if make_plots:
+            fig, ax = plt.subplots(figsize=(5, 5))
+            ax.set_title(f"ROC: {NEG_LABEL} vs {POS_LABEL} ({ds})\nScore={SCORE_COL}")
+            ax.set_xlabel("Specificity")
+            ax.set_ylabel("Sensitivity")
+            ax.set_xlim(1, 0)   # reverse axis (high specificity on left)
+            ax.plot([1, 0], [0, 1], linestyle="--", linewidth=1)
+
+        # Run per race
+        auc_info = {}
+        roc_info = {}
+
+        for race in ["NHW", "B/AA"]:
+            sub_r = (
+                sub[sub["race_group"] == race]
+                .dropna(subset=["y", SCORE_COL])
+                .copy()
+            )
+        
+            # Count CU and DAT
+            n_CU  = int((sub_r["y"] == 0).sum())
+            n_DAT = int((sub_r["y"] == 1).sum())
+        
+            # Need both classes present
+            if sub_r["y"].nunique() < 2 or len(sub_r) < 10:
+                results_rows.append({
+                    "dataset": ds,
+                    "race": race,
+                    "n": len(sub_r),
+                    "n_CU": n_CU,
+                    "n_DAT": n_DAT,
+                    "auc": np.nan,
+                    "auc_ci_low": np.nan,
+                    "auc_ci_high": np.nan,
+                    "youden_cutoff": np.nan,
+                    "sensitivity": np.nan,
+                    "specificity": np.nan
+                })
+                continue
+
+            y = sub_r["y"].to_numpy()
+            score = sub_r[SCORE_COL].to_numpy()
+
+            # AUC + CI
+            auc, (lo, hi), auc_boot = bootstrap_auc_ci(
+                y, score, n_boot=N_BOOT_CI, seed=RANDOM_SEED
+            )
+
+            # Youden cutoff
+            yd = youden_cutoff(y, score)
+
+            # Point estimates at the (point-estimated) Youden cutoff
+            ppvnpv_point = confusion_from_cutoff(y, score, yd["cutoff_youden"])
+            
+            # Bootstrap CIs for PPV/NPV
+            ppvnpv_ci = bootstrap_ppv_npv_ci(
+                y, score,
+                n_boot=N_BOOT_CI,
+                seed=RANDOM_SEED,
+                recompute_cutoff_each_boot=True  # <- recommended
+                # If you want CI conditional on the *point* cutoff instead:
+                # recompute_cutoff_each_boot=False, fixed_cutoff=yd["cutoff_youden"]
+            )
+
+            # ROC curve
+            fpr, tpr, thr = roc_curve(y, score)
+
+            auc_info[race] = (y, score, auc)
+            roc_info[race] = (fpr, tpr)
+
+            results_rows.append({
+                "dataset": ds,
+                "race": race,
+                "n": len(sub_r),
+                "n_CU": n_CU,
+                "n_DAT": n_DAT,
+                "auc": auc,
+                "auc_ci_low": lo,
+                "auc_ci_high": hi,
+                "youden_cutoff": yd["cutoff_youden"],
+                "sensitivity": yd["sensitivity"],
+                "specificity": yd["specificity"],
+                "prevalence": ppvnpv_point["prevalence"],
+                "ppv": ppvnpv_point["PPV"],
+                "ppv_ci_low": ppvnpv_ci["ppv_ci_low"],
+                "ppv_ci_high": ppvnpv_ci["ppv_ci_high"],
+                "npv": ppvnpv_point["NPV"],
+                "npv_ci_low": ppvnpv_ci["npv_ci_low"],
+                "npv_ci_high": ppvnpv_ci["npv_ci_high"],
+                "n_boot_valid_ppvnpv": ppvnpv_ci["n_boot_valid"],
+            })
+            if make_plots:
+                label = f"{race}: AUC={auc:.2f} [{lo:.2f}, {hi:.2f}]"
+                specificity = 1 - fpr
+                # Prevent floating point overflow outside [0,1]
+                specificity = np.clip(specificity, 0, 1)
+                tpr = np.clip(tpr, 0, 1)
+                ax.plot(specificity, tpr, linewidth=1, label=label)
+
+
+        # Compare NHW vs B/AA AUCs (within this dataset)
+        # Bootstrap p-value (independent groups)
+        if "NHW" in auc_info and "B/AA" in auc_info:
+            yW, sW, aucW = auc_info["NHW"]
+            yB, sB, aucB = auc_info["B/AA"]
+
+            diff, p = bootstrap_auc_diff_pvalue(
+                yW, sW, yB, sB, n_boot=N_BOOT_CI, seed=RANDOM_SEED
+            )
+
+            # store comparison
+            results_rows.append({
+                "dataset": ds,
+                "race": "NHW vs B/AA (AUC diff)",
+                "n": np.nan,
+                "n_CU": np.nan,
+                "n_DAT": np.nan,
+                "auc": diff,                     
+                "auc_ci_low": np.nan,
+                "auc_ci_high": np.nan,
+                "youden_cutoff": np.nan,
+                "sensitivity": np.nan,
+                "specificity": np.nan,
+                "p_value_auc_diff_bootstrap": p
+            })
+
+        # Save plot
+        if make_plots:
+            ax.set_xlim(1.02, -0.02)
+            ax.set_ylim(-0.02, 1.02)
+            ax.legend(loc="lower right")
+            fig.tight_layout()
+            fig.savefig(f"{out_dir}/ROC_{ds}_{SCORE_COL}.jpg", dpi=300, bbox_inches="tight")
+            fig.savefig(f"{out_dir}/ROC_{ds}_{SCORE_COL}.tif", dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+    results = pd.DataFrame(results_rows)
+
+    # format columns
+    if "p_value_auc_diff_bootstrap" not in results.columns:
+        results["p_value_auc_diff_bootstrap"] = np.nan
+
+    results.to_csv(f"{out_dir}/roc_auc_summary_{SCORE_COL}.csv", index=False)
+    return results
+
+# -----------------------------
+# RUN 
+# -----------------------------
+roc_results = run_roc_by_dataset_and_race(analysis_df, make_plots=True, out_dir="roc_outputs")
+print(roc_results)
