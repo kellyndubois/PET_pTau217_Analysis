@@ -13,14 +13,33 @@ analysis_df['educ_group'] = analysis_df['educ_group'].astype(
     )
 )
 
-def classify_apoe(x):
-    if pd.isna(x):
-        return np.nan
-    x = str(x)
-    return 'positive' if any(a in x for a in ['2', '4']) else 'negative'
+APOE_E4_COUNT_MAP = {
+    1: 0,  # e3/e3
+    2: 1,  # e3/e4
+    3: 0,  # e3/e2
+    4: 2,  # e4/e4
+    5: 1,  # e4/e2
+    6: 0   # e2/e2
+}
 
-analysis_df['apoe_pos'] = analysis_df['apoe'].apply(classify_apoe)
-
-analysis_df['apoe_pos'] = analysis_df['apoe_pos'].astype(
-    pd.CategoricalDtype(categories=['negative', 'positive'], ordered=True)
+analysis_df["apoe_e4_count"] = (
+    pd.to_numeric(analysis_df["apoe"], errors="coerce")
+    .map(APOE_E4_COUNT_MAP)
 )
+
+analysis_df["apoe_pos"] = (
+    analysis_df["apoe_e4_count"]
+    .map({0: "negative", 1: "positive", 2: "positive"})
+    .astype(pd.CategoricalDtype(
+        categories=["negative", "positive"]
+    ))
+)
+
+# Validation checks
+assert analysis_df.loc[
+    analysis_df["apoe"] == 5, "apoe_pos"
+].eq("positive").all()
+
+assert analysis_df.loc[
+    analysis_df["apoe"] == 4, "apoe_e4_count"
+].eq(2).all()
