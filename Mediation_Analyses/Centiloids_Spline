@@ -1,0 +1,139 @@
+import numpy as np, pandas as pd, patsy, statsmodels.api as sm
+from scipy.optimize import minimize
+from scipy.special import log_ndtr
+from scipy.stats import norm, truncnorm
+
+
+def mediation_two_part_truncated_spline(df, n_boot=10, n_nodes=25, seed=42):
+    required=['race_black','amyloid_status_num','centiloids','log_ptau217','age','sex','apoe_pos','educ_group','dataset']
+    data=df[required].copy().dropna().reset_index(drop=True)
+    for c in ['race_black','amyloid_status_num','centiloids','log_ptau217','age']:
+        data[c]=pd.to_numeric(data[c],errors='raise')
+    if not np.all(np.isfinite(data[['race_black','amyloid_status_num','centiloids','log_ptau217','age']].to_numpy())): raise ValueError('Nonfinite numbers')
+    if set(data.race_black.unique())!={0,1} or set(data.amyloid_status_num.unique())!={0,1}: raise ValueError('Binary values required')
+    if ((data.amyloid_status_num==0)&(data.centiloids>=20)).any() or ((data.amyloid_status_num==1)&(data.centiloids<20)).any(): raise ValueError('Status and mediator are inconsistent')
+    base='race_black + age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)'
+    xm=patsy.dmatrix(base,data,return_type='dataframe')
+    xinfo=xm.design_info
+    race_i=list(xm.columns).index('race_black')
+    x=np.asarray(xm,dtype=float)
+    y=data.log_ptau217.to_numpy(dtype=float)
+    s=data.amyloid_status_num.to_numpy(dtype=int)
+    m=data.centiloids.to_numpy(dtype=float)
+    # fixed knots from data
+    k1,k2=np.quantile(m,[1/3,2/3]); lower=min(-200.,float(m.min())-100.); upper=max(300.,float(m.max())+100.)
+    out_r = f'race_black + cr(centiloids, knots=({float(k1)}, {float(k2)}), lower_bound={lower}, upper_bound={upper}) + age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)'
+    outmx=patsy.dmatrix(out_r,data,return_type='dataframe')
+    out_info=outmx.design_info
+    outr_i=list(outmx.columns).index('race_black')
+    w=np.asarray(outmx,dtype=float)
+    quant=(np.arange(n_nodes)+0.5)/n_nodes
+    n=len(data)
+    def fit_truncated(xsub, ysub, side):
+        beta0=np.linalg.lstsq(xsub,ysub,rcond=None)[0]
+        sd0=np.std(ysub-xsub@beta0,ddof=1)
+        par0=np.r_[beta0,np.log(max(sd0,0.1))]
+        def nll(par):
+            mu=xsub@par[:-1]
+            sd=np.exp(par[-1])
+            z=(ysub-mu)/sd
+            a=(20-mu)/sd
+            logp=norm.logpdf(z)-par[-1]
+            if side==0:
+                logp-=log_ndtr(a)
+            else:
+                logp-=log_ndtr(-a)
+            return -np.sum(logp) if np.isfinite(logp).all() else 1e100
+        bounds=[(None,None)]*xsub.shape[1]+[(np.log(.05),np.log(250.))]
+        fit=minimize(nll,par0,method='L-BFGS-B',bounds=bounds,options={'maxiter':500,'ftol':1e-9})
+        if not fit.success: raise RuntimeError('trunc fit: '+fit.message)
+        return fit.x[:-1], float(np.exp(fit.x[-1]))
+    def estimate(idx):
+        di=data.iloc[idx].reset_index(drop=True)
+        xi=x[idx,:].copy(); wi=w[idx,:]; yi=y[idx]; mi=m[idx]; si=s[idx]
+        neg=(si==0);pos=~neg
+        if min(neg.sum(),pos.sum())<20 or len(np.unique(xi[:,race_i]))!=2: raise ValueError('Too few groups')
+        status_fit=sm.GLM(si,xi,family=sm.families.Binomial()).fit(maxiter=100)
+        if not status_fit.converged: raise ValueError('GLM failed')
+        bn,sdn=fit_truncated(xi[neg],mi[neg],0)
+        bp,sdp=fit_truncated(xi[pos],mi[pos],1)
+        out_fit=sm.OLS(yi,wi).fit()
+        direct=float(out_fit.params[outr_i])
+        total_fit=sm.OLS(yi,xi).fit()
+        total_ols=float(total_fit.params[race_i])
+        xi0=xi.copy();xi0[:,race_i]=0
+        xi1=xi.copy();xi1[:,race_i]=1
+        # score under race=0 outcome
+        def expectation(xcf,beta,sd,side):
+            mus=xcf@beta
+            a=(20-mus)/sd
+            if side==0:
+                values=truncnorm.ppf(quant[None,:],-np.inf,a[:,None],loc=mus[:,None],scale=sd)
+            else:
+                values=truncnorm.ppf(quant[None,:],a[:,None],np.inf,loc=mus[:,None],scale=sd)
+            if not np.isfinite(values).all(): raise ValueError('Invalid truncated quantiles')
+            repeated=di.iloc[np.repeat(np.arange(len(di)),n_nodes)].copy()
+            repeated['race_black']=0
+            repeated['centiloids']=values.reshape(-1)
+            design=np.asarray(patsy.build_design_matrices([out_info],repeated)[0])
+            expected=(design@out_fit.params).reshape(len(di),n_nodes).mean(axis=1)
+            return expected, values.min(), values.max()
+        p0=np.asarray(status_fit.predict(xi0));p1=np.asarray(status_fit.predict(xi1))
+        e00, min00,max00=expectation(xi0,bn,sdn,0)
+        e01, min01,max01=expectation(xi0,bp,sdp,1)
+        e10, min10,max10=expectation(xi1,bn,sdn,0)
+        e11, min11,max11=expectation(xi1,bp,sdp,1)
+        Ey0=(1-p0)*e00+p0*e01
+        Ey1=(1-p1)*e10+p1*e11
+        acme=float(np.mean(Ey1-Ey0))
+        total=acme+direct
+        return {'ACME':acme,'ADE':direct,'Total':total,'Prop_mediated':acme/total if abs(total)>1e-8 else np.nan,'Observed_OLS_Total':total_ols,'max_neg':max(max00,max10),'min_pos':min(min01,min11),'pred_min':min(min00,min01,min10,min11),'pred_max':max(max00,max01,max10,max11)}
+    point=estimate(np.arange(n));boots=[];fail=[];rng=np.random.default_rng(seed)
+    for b in range(n_boot):
+        try:boots.append(estimate(rng.integers(0,n,n)))
+        except Exception as e:fail.append((b,str(e)))
+    if n_boot > 0 and len(boots) < 0.95*n_boot:
+        raise RuntimeError(f"Only {len(boots)}/{n_boot} bootstrap fits succeeded. Examples: {fail[:3]}")
+    result={k:{'estimate':float(point[k]),'CI':tuple(np.nanpercentile([v[k] for v in boots],[2.5,97.5])) if boots else (np.nan,np.nan)} for k in ['ACME','ADE','Total','Prop_mediated','Observed_OLS_Total']}
+    result.update({'diagnostics':{k:point[k] for k in ['max_neg','min_pos','pred_min','pred_max']},'n_boot_successful':len(boots),'n_boot_requested':n_boot,'failures':fail[:10], 'N':n,'knots':(k1,k2),'bounds':(lower,upper)})
+    return result
+
+res_truncated = mediation_two_part_truncated_spline(
+    df=df_two_part,
+    n_boot=5000,
+    n_nodes=50,
+    seed=42
+)
+
+for key in [
+    "ACME",
+    "ADE",
+    "Total",
+    "Prop_mediated",
+    "Observed_OLS_Total"
+]:
+    result = res_truncated[key]
+
+    print(
+        f"{key}: {result['estimate']:.4f} "
+        f"(95% CI {result['CI'][0]:.4f}, "
+        f"{result['CI'][1]:.4f})"
+    )
+
+print("\nN:", res_truncated["N"])
+
+print(
+    "Successful bootstraps:",
+    res_truncated["n_boot_successful"]
+)
+
+print(
+    "\nMediator support diagnostics:",
+    res_truncated["diagnostics"]
+)
+
+print(
+    "\nBootstrap failures:",
+    res_truncated["failures"]
+)
+
