@@ -1,78 +1,171 @@
-def mediation_continuous(df, exposure, mediator, outcome, covariates=None, n_boot=1000, random_state=42):
-    import statsmodels.formula.api as smf
-    from sklearn.utils import resample
-    import numpy as np
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
 
+
+def mediation_continuous(
+    df,
+    exposure="race_black",
+    mediator="centiloids",
+    outcome="log_ptau217",
+    covariates=None,
+    n_boot=5000,
+    random_state=42
+):
     if covariates is None:
         covariates = []
 
-    rng = np.random.default_rng(random_state)
+    # The supplied dataframe must already be complete-case.
+    if df.isna().any().any():
+        raise ValueError(
+            "Input contains missing values. Create the complete-case "
+            "mediation dataset before fitting."
+        )
 
-    def _estimate(df):
-        # mediator model: linear
-        med_formula = f"{mediator} ~ {exposure}"
-        if covariates:
-            med_formula += " + " + " + ".join(covariates)
+    if not set(df[exposure].unique()).issubset({0, 1}):
+        raise ValueError("Exposure must be encoded as 0/1.")
 
-        med_fit = smf.ols(med_formula, data=df).fit()
+    if df[exposure].nunique() != 2:
+        raise ValueError("Both exposure groups must be present.")
 
-        # outcome model: linear
-        out_formula = f"{outcome} ~ {exposure} + {mediator}"
-        if covariates:
-            out_formula += " + " + " + ".join(covariates)
+    cov_str = (
+        " + " + " + ".join(covariates)
+        if covariates else ""
+    )
 
-        out_fit = smf.ols(out_formula, data=df).fit()
+    med_formula = (
+        f"{mediator} ~ {exposure}{cov_str}"
+    )
+    out_formula = (
+        f"{outcome} ~ {exposure} + {mediator}{cov_str}"
+    )
+    total_formula = (
+        f"{outcome} ~ {exposure}{cov_str}"
+    )
 
-        # coefficients needed
+    def estimate(data):
+        med_fit = smf.ols(med_formula, data=data).fit()
+        out_fit = smf.ols(out_formula, data=data).fit()
+        total_fit = smf.ols(total_formula, data=data).fit()
+
         a = med_fit.params[exposure]
         b = out_fit.params[mediator]
         c_prime = out_fit.params[exposure]
-        # total effect (from model without mediator)
-        tot = a * b + c_prime
+        total_direct = total_fit.params[exposure]
 
         return {
             "ACME": a * b,
             "ADE": c_prime,
-            "Total": tot
+            "Total": total_direct,
+            "Total_from_paths": a * b + c_prime
         }
 
-    point = _estimate(df)
+    point = estimate(df)
 
-    boots = {"ACME": [], "ADE": [], "Total": []}
-    for _ in range(n_boot):
-        bs = resample(df, replace=True, random_state=rng.integers(1e9))
-        est = _estimate(bs)
-        for k in boots:
-            boots[k].append(est[k])
+    if not np.isclose(
+        point["Total"],
+        point["Total_from_paths"],
+        rtol=1e-6,
+        atol=1e-8
+    ):
+        raise RuntimeError(
+            "Total effect does not match a*b + c'. "
+            "Check model specifications and data."
+        )
 
-    def ci(x):
-        return (np.percentile(x, 2.5), np.percentile(x, 97.5))
+    rng = np.random.default_rng(random_state)
+    boot_results = []
 
-    return {
-        "ACME": {"estimate": point["ACME"], "CI": ci(boots["ACME"])},
-        "ADE": {"estimate": point["ADE"], "CI": ci(boots["ADE"])},
-        "Total": {"estimate": point["Total"], "CI": ci(boots["Total"])},
-        "Prop_mediated": {"estimate": point["ACME"]/point["Total"], 
-                          "CI": ci([a/t if t!=0 else np.nan for a,t in zip(boots["ACME"],boots["Total"])])}
+    for i in range(n_boot):
+        indices = rng.choice(
+            len(df),
+            size=len(df),
+            replace=True
+        )
+        sample = df.iloc[indices]
+
+        est = estimate(sample)
+
+        boot_results.append(est)
+
+    boot_df = pd.DataFrame(boot_results)
+
+    # Calculate proportions only when denominators
+    # are sufficiently far from zero.
+    point_total = point["Total"]
+    scale = max(abs(point_total), 1.0)
+    tol = 1e-8 * scale
+
+    if abs(point_total) > tol:
+        point_prop = point["ACME"] / point_total
+    else:
+        point_prop = np.nan
+
+    boot_df["Prop_mediated"] = np.where(
+        np.abs(boot_df["Total"]) > tol,
+        boot_df["ACME"] / boot_df["Total"],
+        np.nan
+    )
+
+    point["Prop_mediated"] = point_prop
+
+    # A proportion mediated can be unstable if
+    # the total association is near zero.
+    def summarize(key):
+        values = boot_df[key].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+
+        if len(values) < n_boot:
+            print(
+                f"Warning: {key} has "
+                f"{n_boot - len(values)} invalid bootstrap results."
+            )
+
+        return {
+            "estimate": point[key],
+            "CI": tuple(
+                np.percentile(values, [2.5, 97.5])
+            ) if len(values) > 0 else (np.nan, np.nan)
+        }
+
+    results = {
+        key: summarize(key)
+        for key in ["ACME", "ADE", "Total", "Prop_mediated"]
     }
 
-df_med = df_med.copy()
+    results["N"] = len(df)
+    results["n_boot"] = n_boot
+    results["formulas"] = {
+        "mediator": med_formula,
+        "outcome": out_formula,
+        "total": total_formula
+    }
 
-# 1) Numerics as numeric
+    return results
+
+# Make sure these are typed reasonably
+analysis_df["madc_dx"] = analysis_df["madc_dx"].astype("category")
+analysis_df["sex"] = analysis_df["sex"].astype("category")
+analysis_df["apoe_pos"] = analysis_df["apoe_pos"].astype("category")
+analysis_df["educ_group"] = analysis_df["educ_group"].astype("category")
+analysis_df["dataset"] = analysis_df["dataset"].astype("category")
+
+# 1) Make sure the key numeric variables are numeric
 for col in ["race_black", "centiloids", "log_ptau217", "age"]:
-    if col in df_med.columns:
-        df_med[col] = pd.to_numeric(df_med[col], errors="coerce")
+    if col in analysis_df.columns:
+        analysis_df[col] = pd.to_numeric(analysis_df[col], errors="coerce")
 
-# 2) Categoricals as categorical
-cat_covs = ["sex", "apoe", "educ_group", "dataset", "madc_dx"]
+# 2) Make sure the covariates that are categorical are actually 'category'
+cat_covs = ["sex", "apoe_pos", "educ_group", "dataset", "madc_dx"]
 for col in cat_covs:
-    if col in df_med.columns:
-        df_med[col] = df_med[col].astype("category")
+    if col in analysis_df.columns:
+        analysis_df[col] = analysis_df[col].astype("category")
 
 # 3) Drop rows with missing in anything needed for mediation
-covs = ["age", "sex", "apoe", "educ_group", "dataset", "madc_dx"]
+covs = ["age", "sex", "apoe_pos", "educ_group", "dataset"]
 needed = ["log_ptau217", "race_black", "centiloids"] + covs
-df_med = df_med.dropna(subset=needed).copy()
+df_med = analysis_df[needed].dropna().copy()
 
 res = mediation_continuous(
     df_med,
