@@ -1,0 +1,67 @@
+Dx-adjusted model
+
+import statsmodels.formula.api as smf
+
+# 1) Define covariates 
+covariates = ["age", "sex", "apoe_pos", "educ_group", "dataset"]  # adjust to your actual names
+cov_str = " + ".join(covariates)
+
+# 2) Define categoricals
+cat_cols = ["madc_dx", "sex", "apoe_pos", "educ_group", "dataset"]
+for col in cat_cols:
+    if col in analysis_df.columns:
+        analysis_df[col] = analysis_df[col].astype("category")
+        
+analysis_df["log_ptau217"] = np.log(analysis_df["ptau217"])
+
+# 3) Build formula
+formula_dx = f"log_ptau217 ~ race_black + C(madc_dx) + {cov_str}"
+
+# 4) Fit model
+model_dx = smf.ols(formula_dx, data=analysis_df).fit(cov_type="HC3")
+print(model_dx.summary())
+
+binary Ab PET-adjusted model
+analysis_df["amyloid_status_num"] = (
+    pd.to_numeric(analysis_df["amyloid_status"], errors="coerce")
+    .astype(float)   # ensures np.nan, not pd.NA
+)
+
+covariates = ["age", "sex", "apoe_pos", "educ_group", "dataset"]  # whatever you used
+cov_str = " + ".join(covariates)
+
+mask = analysis_df["amyloid_status_num"].notna()
+df_pet = analysis_df[mask].copy()
+
+formula_pet = (
+    f"log_ptau217 ~ race_black + amyloid_status_num + {cov_str}"
+)
+
+model_pet = smf.ols(formula_pet, data=df_pet).fit(cov_type="HC3")
+print(model_pet.summary())
+
+Centiloids-adjusted model
+from patsy import cr
+import statsmodels.formula.api as smf
+
+covariates = [
+    "age",
+    "sex",
+    "apoe_pos",
+    "educ_group",
+    "dataset"
+]
+
+cov_str = " + ".join(covariates)
+
+formula_pet = (
+    f"log_ptau217 ~ race_black + "
+    f"cr(centiloids, df=4, constraints='center') + {cov_str}"
+)
+
+model_pet = smf.ols(
+    formula_pet,
+    data=df_pet
+).fit(cov_type="HC3")
+
+print(model_pet.summary())
