@@ -66,7 +66,7 @@ def smd_weighted(df, cov, treat="race_black", w="sw_trunc"):
 
 
 # -----------------------------
-# Prep dataset
+# make sure data types are correct
 # -----------------------------
 df = analysis_df.copy()
 
@@ -74,9 +74,12 @@ for col in ["sex", "apoe_pos", "educ_group", "dataset", "madc_dx"]:
     if col in df.columns:
         df[col] = df[col].astype("category")
 
+# ensure numerics
 df["race_black"] = pd.to_numeric(df["race_black"], errors="coerce")
 df["age"] = pd.to_numeric(df["age"], errors="coerce")
 df["log_ptau217"] = pd.to_numeric(df["log_ptau217"], errors="coerce")
+
+# make sure amyloid & centiloids are numeric if present
 if "amyloid_status_num" in df.columns:
     df["amyloid_status_num"] = pd.to_numeric(df["amyloid_status_num"], errors="coerce")
 if "centiloids" in df.columns:
@@ -98,12 +101,23 @@ df_full_w, ps_full = compute_stabilized_ipw(
     df_full, treat="race_black", ps_formula=ps_formula_full, trunc=(0.1, 10), verbose=True
 )
 
+print("\nBalance check (FULL):")
+print("age SMD unweighted:", smd_unweighted(df_full, "age"))
+print("age SMD weighted  :", smd_weighted(df_full_w, "age"))
+
 formula_dx_ipw = (
-    "log_ptau217 ~ race_black * C(madc_dx) + age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)"
+    "log_ptau217 ~ race_black + C(madc_dx) + age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)"
 )
-dx_ipw = smf.wls(formula_dx_ipw, data=df_full_w, weights=df_full_w["sw_trunc"]).fit()
+dx_ipw = smf.wls(formula_dx_ipw, data=df_full_w, weights=df_full_w["sw_trunc"]).fit(cov_type="HC3")
 print("\n--- Dx model (FULL weights) ---")
 print(dx_ipw.summary())
+
+results_dx_ipw = export_ols_results(
+    dx_ipw,
+    "IPW_DX",
+    labels=variable_labels
+)
+
 
 # -----------------------------
 # (B) PET-subset IPW (binary amyloid)
@@ -119,13 +133,23 @@ df_pet_bin_w, ps_pet_bin = compute_stabilized_ipw(
     df_pet_bin, treat="race_black", ps_formula=ps_formula_pet, trunc=(0.1, 10), verbose=True
 )
 
+print("\nBalance check (PET binary subset):")
+print("age SMD unweighted:", smd_unweighted(df_pet_bin, "age"))
+print("age SMD weighted  :", smd_weighted(df_pet_bin_w, "age"))
+
 formula_pet_ipw = (
-    "log_ptau217 ~ race_black * amyloid_status_num +"
+    "log_ptau217 ~ race_black + amyloid_status_num +"
     "age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)"
 )
-pet_ipw = smf.wls(formula_pet_ipw, data=df_pet_bin_w, weights=df_pet_bin_w["sw_trunc"]).fit()
+pet_ipw = smf.wls(formula_pet_ipw, data=df_pet_bin_w, weights=df_pet_bin_w["sw_trunc"]).fit(cov_type="HC3")
 print("\n--- PET model (binary amyloid; PET-specific weights) ---")
 print(pet_ipw.summary())
+
+results_pet_ipw = export_ols_results(
+    pet_ipw,
+    "IPW_PET",
+    labels=variable_labels
+)
 
 # -----------------------------
 # (C) PET-subset IPW (centiloids)
@@ -137,9 +161,28 @@ df_pet_cent_w, ps_pet_cent = compute_stabilized_ipw(
     df_pet_cent, treat="race_black", ps_formula=ps_formula_pet, trunc=(0.1, 10), verbose=True
 )
 
-formula_cent_ipw = (
-    "log_ptau217 ~ race_black * centiloids + age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)"
+print("\nBalance check (PET centiloids subset):")
+print("age SMD unweighted:", smd_unweighted(df_pet_cent, "age"))
+print("age SMD weighted  :", smd_weighted(df_pet_cent_w, "age"))
+
+formula_cent_ipw_spline = (
+    "log_ptau217 ~ race_black "
+    "+ cr(centiloids, df=4, constraints='center') "
+    "+ age + C(sex) + C(apoe_pos) "
+    "+ C(educ_group) + C(dataset)"
 )
-cent_ipw = smf.wls(formula_cent_ipw, data=df_pet_cent_w, weights=df_pet_cent_w["sw_trunc"]).fit()
-print("\n--- PET model (centiloids; PET-specific weights) ---")
-print(cent_ipw.summary())
+
+cent_ipw_spline = smf.wls(
+    formula_cent_ipw_spline,
+    data=df_pet_cent_w,
+    weights=df_pet_cent_w["sw_trunc"]
+).fit(cov_type="HC3")
+
+print(cent_ipw_spline.summary())
+
+results_cent_ipw = export_ols_results(
+    cent_ipw_spline,
+    "IPW_Centiloids",
+    labels=variable_labels
+)
+
