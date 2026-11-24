@@ -1,59 +1,253 @@
-import seaborn as sns
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import statsmodels.formula.api as smf
+from patsy import build_design_matrices
 
-# ------------- Prep data -------------
+# ============================================================
+# 1. Prepare data
+# ============================================================
+
 df = analysis_df.copy()
 
-# ensure numeric
-df["centiloids"] = pd.to_numeric(df["centiloids"], errors="coerce")
-df["log_ptau217"]    = pd.to_numeric(df["log_ptau217"],    errors="coerce")
+# Numeric variables
+for col in ["centiloids", "log_ptau217", "race_black", "age"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# drop rows missing key vars
-df_plot = df.dropna(subset=["centiloids", "ptau217", "race_black"]).copy()
+# Categorical variables
+for col in ["sex", "apoe_pos", "educ_group", "dataset"]:
+    df[col] = df[col].astype("category")
 
-# categorical label for plotting
-df_plot["race_group"] = df_plot["race_black"].map({0: "NHW", 1: "B/AA"})
-df_plot["race_group"] = df_plot["race_group"].astype("category")
+# Complete cases for spline regression
+needed = [
+    "centiloids",
+    "log_ptau217",
+    "race_black",
+    "age",
+    "sex",
+    "apoe_pos",
+    "educ_group",
+    "dataset"
+]
 
-# ------------- Plot with separate regression lines -------------
-sns.set(style="whitegrid")
+df_plot = df.dropna(subset=needed).copy()
 
-g = sns.lmplot(
+# Race labels for plotting
+df_plot["race_group"] = df_plot["race_black"].map({
+    0: "NHW",
+    1: "B/AA"
+})
+
+# PET-positive subset
+df_plot_pos = df_plot[df_plot["centiloids"] >= 20].copy()
+
+print("All PET sample N:", len(df_plot))
+print(df_plot["race_group"].value_counts())
+
+print("\nPET >=20 sample N:", len(df_plot_pos))
+print(df_plot_pos["race_group"].value_counts())
+
+
+# ============================================================
+# 2. Helper function:
+#    fit spline model + compute marginal standardized curves
+# ============================================================
+
+def fit_spline_and_get_curves(
+    data,
+    formula,
+    x_var="centiloids",
+    race_var="race_black",
+    grid_points=200,
+    robust=True
+):
+    """
+    Fits spline regression and returns marginal standardized
+    predicted curves by race with 95% CIs.
+    """
+
+    model = smf.ols(formula, data=data).fit()
+
+    if robust:
+        model_robust = model.get_robustcov_results(cov_type="HC3")
+        beta = np.asarray(model_robust.params)
+        vcov = np.asarray(model_robust.cov_params())
+    else:
+        beta = np.asarray(model.params)
+        vcov = np.asarray(model.cov_params())
+
+    design_info = model.model.data.design_info
+
+    x_grid = np.linspace(
+        data[x_var].min(),
+        data[x_var].max(),
+        grid_points
+    )
+
+    out = []
+
+    for race_value, race_label in [(0, "NHW"), (1, "B/AA")]:
+        for x in x_grid:
+
+            temp = data.copy()
+            temp[race_var] = race_value
+            temp[x_var] = x
+
+            X = np.asarray(
+                build_design_matrices([design_info], temp)[0]
+            )
+
+            xbar = X.mean(axis=0)
+
+            pred = float(xbar @ beta)
+            se = float(np.sqrt(np.maximum(xbar @ vcov @ xbar, 0)))
+
+            out.append({
+                x_var: x,
+                "race_black": race_value,
+                "race_group": race_label,
+                "fit": pred,
+                "lower": pred - 1.96 * se,
+                "upper": pred + 1.96 * se
+            })
+
+    curve_df = pd.DataFrame(out)
+    return model, curve_df
+
+
+# ============================================================
+# 3. Fit models
+# ============================================================
+
+formula_spline = (
+    "log_ptau217 ~ race_black + cr(centiloids, df=4, constraints='center') "
+    "+ age + C(sex) + C(apoe_pos) + C(educ_group) + C(dataset)"
+)
+
+# Panel A: all PET participants
+model_all, curve_all = fit_spline_and_get_curves(
     data=df_plot,
-    x="centiloids",
-    y="log_ptau217",
-    hue="race_group",
-    markers=["o", "s"],
-    palette="Set1",
-    height=5,
-    aspect=1.4,
-    scatter_kws={"alpha": 0.6, "s": 40},
-    line_kws={"linewidth": 2}
+    formula=formula_spline
 )
 
-g.set_axis_labels("Centiloids", "ln(Plasma pTau-217)")
-g.fig.suptitle("pTau-217 vs Centiloids by Race", y=1.02)
-
-# Move legend 
-g._legend.set_title("Race")
-g._legend.set_bbox_to_anchor((0.8, 0.5))
-g._legend.set_loc("center left")
-g.fig.subplots_adjust(right=0.8)
-
-# ---- Save files ----
-g.fig.savefig(
-    "ptau217_vs_centiloids_by_race_recodedamyloid.jpg",
-    dpi=300,
-    bbox_inches="tight"
+# Panel B: PET-positive only
+model_pos, curve_pos = fit_spline_and_get_curves(
+    data=df_plot_pos,
+    formula=formula_spline
 )
 
-g.fig.savefig(
-    "ptau217_vs_centiloids_by_race_recodedamyloid.tif",
-    dpi=300,
-    format="tiff",
-    bbox_inches="tight"
+print(model_all.summary())
+print(model_pos.summary())
+
+
+# ============================================================
+# 4. Plot
+# ============================================================
+
+sns.set_theme(style="whitegrid")
+
+colors = {
+    "B/AA": "#E64B50",
+    "NHW": "#4C90C0"
+}
+
+markers = {
+    "B/AA": "o",
+    "NHW": "s"
+}
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
+
+# ---------- Panel A ----------
+ax = axes[0]
+
+for group in ["B/AA", "NHW"]:
+    sub = df_plot[df_plot["race_group"] == group]
+    ax.scatter(
+        sub["centiloids"],
+        sub["log_ptau217"],
+        color=colors[group],
+        marker=markers[group],
+        alpha=0.55,
+        s=60,
+        label=group
+    )
+
+    csub = curve_all[curve_all["race_group"] == group]
+    ax.plot(
+        csub["centiloids"],
+        csub["fit"],
+        color=colors[group],
+        linewidth=2.5
+    )
+    ax.fill_between(
+        csub["centiloids"],
+        csub["lower"],
+        csub["upper"],
+        color=colors[group],
+        alpha=0.15
+    )
+
+ax.set_title("All Participants with Aβ PET", fontsize=18)
+ax.set_xlabel("Centiloids", fontsize=16)
+ax.set_ylabel("ln(Plasma pTau-217)", fontsize=16)
+
+
+# ---------- Panel B ----------
+ax = axes[1]
+
+for group in ["B/AA", "NHW"]:
+    sub = df_plot_pos[df_plot_pos["race_group"] == group]
+    ax.scatter(
+        sub["centiloids"],
+        sub["log_ptau217"],
+        color=colors[group],
+        marker=markers[group],
+        alpha=0.55,
+        s=60,
+        label=group
+    )
+
+    csub = curve_pos[curve_pos["race_group"] == group]
+    ax.plot(
+        csub["centiloids"],
+        csub["fit"],
+        color=colors[group],
+        linewidth=2.5
+    )
+    ax.fill_between(
+        csub["centiloids"],
+        csub["lower"],
+        csub["upper"],
+        color=colors[group],
+        alpha=0.15
+    )
+
+ax.set_title("Participants with Aβ PET ≥ 20 Centiloids", fontsize=18)
+ax.set_xlabel("Centiloids", fontsize=16)
+ax.set_ylabel("ln(Plasma pTau-217)", fontsize=16)
+
+# ---------- Tick label formatting ----------
+for ax in axes:
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=14
+    )
+
+
+# ---------- Shared legend ----------
+handles, labels = axes[1].get_legend_handles_labels()
+fig.legend(
+    handles[:2],
+    labels[:2],
+    title="Race",
+    loc="center right",
+    frameon=False,
+    fontsize=14,
+    title_fontsize=14
 )
 
-plt.show()
+plt.tight_layout(rect=[0, 0, 0.92, 1])
+
